@@ -484,6 +484,79 @@ class MigrationRunner {
           db.run('CREATE INDEX IF NOT EXISTS idx_conversation_messages_session ON conversation_messages(content_session_id, message_index ASC)');
           db.run('CREATE INDEX IF NOT EXISTS idx_conversation_messages_project_epoch ON conversation_messages(project, created_at_epoch DESC)');
         }
+      },
+      {
+        version: 15,
+        up: (db) => {
+          // Shared tokens for read-only JWT-based sharing (issue #33)
+          db.run(`
+            CREATE TABLE IF NOT EXISTS shared_tokens (
+              id TEXT PRIMARY KEY,
+              token TEXT NOT NULL UNIQUE,
+              project TEXT,
+              label TEXT,
+              created_at TEXT NOT NULL,
+              expires_at TEXT NOT NULL,
+              revoked_at TEXT
+            )
+          `);
+          db.run('CREATE INDEX IF NOT EXISTS idx_shared_tokens_token ON shared_tokens(token)');
+          db.run('CREATE INDEX IF NOT EXISTS idx_shared_tokens_project ON shared_tokens(project)');
+        }
+      },
+      {
+        version: 16,
+        up: (db) => {
+          // Multi-user: users table
+          db.run(`
+            CREATE TABLE IF NOT EXISTS users (
+              id TEXT PRIMARY KEY,
+              email TEXT NOT NULL UNIQUE,
+              password_hash TEXT NOT NULL,
+              role TEXT NOT NULL DEFAULT 'viewer',
+              display_name TEXT NOT NULL,
+              avatar_url TEXT,
+              is_active INTEGER NOT NULL DEFAULT 1,
+              created_at TEXT NOT NULL,
+              last_login TEXT
+            )
+          `);
+          db.run('CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email)');
+          db.run('CREATE INDEX IF NOT EXISTS idx_users_role ON users(role)');
+
+          // Multi-user: auth sessions
+          db.run(`
+            CREATE TABLE IF NOT EXISTS sessions_auth (
+              id TEXT PRIMARY KEY,
+              user_id TEXT NOT NULL,
+              token TEXT NOT NULL,
+              refresh_token TEXT NOT NULL UNIQUE,
+              expires_at TEXT NOT NULL,
+              refresh_expires_at TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            )
+          `);
+          db.run('CREATE INDEX IF NOT EXISTS idx_sessions_auth_user ON sessions_auth(user_id)');
+          db.run('CREATE INDEX IF NOT EXISTS idx_sessions_auth_token ON sessions_auth(token)');
+          db.run('CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_auth_refresh ON sessions_auth(refresh_token)');
+
+          // Multi-user: audit log
+          db.run(`
+            CREATE TABLE IF NOT EXISTS audit_log (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              user_id TEXT NOT NULL,
+              action TEXT NOT NULL,
+              target TEXT,
+              details TEXT,
+              ip_address TEXT,
+              timestamp TEXT NOT NULL
+            )
+          `);
+          db.run('CREATE INDEX IF NOT EXISTS idx_audit_log_user ON audit_log(user_id)');
+          db.run('CREATE INDEX IF NOT EXISTS idx_audit_log_timestamp ON audit_log(timestamp DESC)');
+          db.run('CREATE INDEX IF NOT EXISTS idx_audit_log_action ON audit_log(action)');
+        }
       }
     ];
   }

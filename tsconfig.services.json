@@ -1,33 +1,33 @@
 {
-  // Runtime layer: CLI + hooks + their transitive deps (sdk, services they import).
-  // This config checks the CLI/hooks entry points; shared deps are resolved transitively.
-  // Part of the typecheck split to fix OOM (issue #67).
+  // Services layer: sqlite, search, routes, jobs, plugins, analytics, summary, openapi.
+  // Split from product config to prevent OOM — services has 52+ files with deep dep trees.
+  // See issue #67.
   "extends": "./tsconfig.json",
   "compilerOptions": {
     "jsx": "preserve",
-    "lib": ["ES2022"],
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
     "noEmit": true,
     "declaration": false,
     "declarationMap": false,
     "sourceMap": false
   },
   "include": [
-    "src/cli/**/*",
-    "src/db/**/*",
-    "src/hooks/**/*",
+    "src/services/**/*",
     "src/shared/**/*",
     "src/types/**/*",
+    "src/db/**/*",
     "src/utils/**/*"
   ],
   "exclude": [
     "node_modules",
     "dist",
     "tests",
-    "src/services/**/*",
+    "src/ui/**/*",
+    "src/cli/**/*",
+    "src/hooks/**/*",
     "src/sdk/**/*",
     "src/servers/**/*",
     "src/plugins/**/*",
-    "src/ui/**/*",
     "src/index.ts"
   ]
 }

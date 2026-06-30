@@ -262,6 +262,9 @@ export const CONFIG_DEFAULTS: Record<string, string | number | boolean> = {
   'backup.intervalHours': 24,
   'backup.maxKeep': 7,
   'backup.compress': false,
+  // Multi-user authentication (disabled by default = single-user mode)
+  'auth.enabled': false,
+  'auth.jwt_secret': '',
 };
 
 /**

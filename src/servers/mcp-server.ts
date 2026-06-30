@@ -92,7 +92,7 @@ async function main() {
   // Ricerca osservazioni e sommari tramite query keyword
   // --------------------------------------------------------------------------
 
-  // @ts-expect-error — MCP SDK registerTool types cause TS2589
+  // @ts-ignore — MCP SDK registerTool types cause TS2589 without stubs (see issue #67)
   server.registerTool(
     'search',
     {
@@ -198,7 +198,7 @@ async function main() {
   // Recupera i dettagli completi di osservazioni specifiche per ID
   // --------------------------------------------------------------------------
 
-  // @ts-expect-error — MCP SDK registerTool types cause TS2589
+  // @ts-ignore — MCP SDK registerTool types cause TS2589 without stubs (see issue #67)
   server.registerTool(
     'get_observations',
     {
@@ -373,7 +373,7 @@ async function main() {
   // Salva conoscenza strutturata: constraint, decision, heuristic, rejected
   // --------------------------------------------------------------------------
 
-  // @ts-expect-error — MCP SDK registerTool types cause TS2589
+  // @ts-ignore — MCP SDK registerTool types cause TS2589 without stubs (see issue #67)
   server.registerTool(
     'store_knowledge',
     {
@@ -413,7 +413,7 @@ async function main() {
   // Riprende una sessione di coding precedente
   // --------------------------------------------------------------------------
 
-  // @ts-expect-error — MCP SDK registerTool types cause TS2589
+  // @ts-ignore — MCP SDK registerTool types cause TS2589 without stubs (see issue #67)
   server.registerTool(
     'resume_session',
     {
@@ -477,7 +477,7 @@ async function main() {
   // Salva manualmente un ricordo/osservazione
   // --------------------------------------------------------------------------
 
-  // @ts-expect-error — MCP SDK registerTool types cause TS2589
+  // @ts-ignore — MCP SDK registerTool types cause TS2589 without stubs (see issue #67)
   server.registerTool(
     'save_memory',
     {
@@ -517,7 +517,7 @@ async function main() {
   // Genera un report di attività per un progetto
   // --------------------------------------------------------------------------
 
-  // @ts-expect-error — MCP SDK registerTool types cause TS2589
+  // @ts-ignore — MCP SDK registerTool types cause TS2589 without stubs (see issue #67)
   server.registerTool(
     'generate_report',
     {
