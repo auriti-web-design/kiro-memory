@@ -5,8 +5,8 @@
  */
 
 import { execSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, rmSync } from 'node:fs';
-import { join, basename } from 'node:path';
+import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync } from 'node:fs';
+import { join } from 'node:path';
 import { homedir } from 'node:os';
 import type { Database } from '../../db/types.js';
 import type { Observation } from '../../types/worker-types.js';

@@ -16,16 +16,15 @@ import {
 } from '../middleware/auth-middleware.js';
 import {
   getUserByEmail,
+  getUserById,
   updateUserLastLogin,
   createAuthSession,
   getSessionByRefreshToken,
   deleteAuthSession,
-  deleteUserSessions,
   logAction,
   toPublicUser,
   countAdmins,
 } from '../sqlite/Users.js';
-import { logger } from '../../utils/logger.js';
 
 // Token TTL constants
 const ACCESS_TOKEN_TTL = 3600;          // 1 hour
@@ -81,7 +80,7 @@ export function createAuthRouter(ctx: WorkerContext): Router {
     const user = getUserByEmail(ctx.db.db, email.toLowerCase().trim());
     if (!user) {
       // Constant-time: still hash something to prevent timing attacks
-      await verifyPassword(password, '$2a$10$invalidhashfortiminginvalidhash');
+      await verifyPassword(password, '$2a$10$abcdefghijklmnopqrstuuABCDEFGHIJKLMNOPQRSTUVWXYZ0123');
       res.status(401).json({ error: 'Invalid email or password' });
       return;
     }
@@ -150,7 +149,6 @@ export function createAuthRouter(ctx: WorkerContext): Router {
     }
 
     // Load user
-    const { getUserById } = await import('../sqlite/Users.js');
     const user = getUserById(ctx.db.db, session.user_id);
     if (!user || !user.is_active) {
       deleteAuthSession(ctx.db.db, session.token);

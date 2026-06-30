@@ -7463,14 +7463,14 @@ function getTeamStatus(config) {
 init_paths();
 import { execSync as execSync3 } from "child_process";
 import { existsSync as existsSync8, mkdirSync as mkdirSync7, readFileSync as readFileSync6, writeFileSync as writeFileSync5, appendFileSync as appendFileSync2, unlinkSync as unlinkSync3 } from "fs";
-import { join as join7, dirname as dirname3, basename as basename4 } from "path";
+import { join as join7, dirname as dirname3, basename as basename3 } from "path";
 import { homedir as homedir4, platform, release } from "os";
 import { fileURLToPath as fileURLToPath2 } from "url";
 import { createInterface } from "readline";
 import * as http from "http";
 var args = process.argv.slice(2);
 var command = args[0];
-var binName = basename4(process.argv[1] ?? "");
+var binName = basename3(process.argv[1] ?? "");
 if (binName === "kiro-memory") {
   console.error('Note: "kiro-memory" is a legacy alias. The canonical command is "totalrecall".\n');
 }

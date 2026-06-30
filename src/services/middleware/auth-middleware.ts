@@ -46,16 +46,20 @@ function createHmacSignature(input: string, secret: string): string {
   return crypto.createHmac('sha256', secret).update(input).digest('base64url');
 }
 
+let _cachedAuthSecret: string | null = null;
+
 export function getJwtSecret(): string {
+  if (_cachedAuthSecret) return _cachedAuthSecret;
+
   const configured = getConfigValue(JWT_SECRET_KEY) as string | null;
   if (configured && typeof configured === 'string' && configured.length >= 32) {
-    return configured;
+    _cachedAuthSecret = configured;
+    return _cachedAuthSecret;
   }
-  // Auto-generate and persist a secret if not set
-  const generated = crypto.randomBytes(48).toString('hex');
-  // We can't call setConfigValue here (circular dep risk), so return generated
-  // The worker-service will persist this on first boot with auth enabled
-  return generated;
+  // Auto-generate and cache for process lifetime if not configured.
+  // The worker-service should persist this on first boot with auth enabled.
+  _cachedAuthSecret = crypto.randomBytes(48).toString('hex');
+  return _cachedAuthSecret;
 }
 
 export function signJwt(payload: Omit<JWTPayload, 'iat' | 'exp'>, secret: string, expiresInSeconds: number): string {
