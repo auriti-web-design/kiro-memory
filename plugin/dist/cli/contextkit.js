@@ -1,7 +1,11 @@
 #!/usr/bin/env node
 import { createRequire } from 'module';const require = createRequire(import.meta.url);
+var __create = Object.create;
 var __defProp = Object.defineProperty;
+var __getOwnPropDesc = Object.getOwnPropertyDescriptor;
 var __getOwnPropNames = Object.getOwnPropertyNames;
+var __getProtoOf = Object.getPrototypeOf;
+var __hasOwnProp = Object.prototype.hasOwnProperty;
 var __require = /* @__PURE__ */ ((x) => typeof require !== "undefined" ? require : typeof Proxy !== "undefined" ? new Proxy(x, {
   get: (a, b) => (typeof require !== "undefined" ? require : a)[b]
 }) : x)(function(x) {
@@ -11,10 +15,29 @@ var __require = /* @__PURE__ */ ((x) => typeof require !== "undefined" ? require
 var __esm = (fn, res) => function __init() {
   return fn && (res = (0, fn[__getOwnPropNames(fn)[0]])(fn = 0)), res;
 };
+var __commonJS = (cb, mod) => function __require2() {
+  return mod || (0, cb[__getOwnPropNames(cb)[0]])((mod = { exports: {} }).exports, mod), mod.exports;
+};
 var __export = (target, all) => {
   for (var name in all)
     __defProp(target, name, { get: all[name], enumerable: true });
 };
+var __copyProps = (to, from, except, desc) => {
+  if (from && typeof from === "object" || typeof from === "function") {
+    for (let key of __getOwnPropNames(from))
+      if (!__hasOwnProp.call(to, key) && key !== except)
+        __defProp(to, key, { get: () => from[key], enumerable: !(desc = __getOwnPropDesc(from, key)) || desc.enumerable });
+  }
+  return to;
+};
+var __toESM = (mod, isNodeMode, target) => (target = mod != null ? __create(__getProtoOf(mod)) : {}, __copyProps(
+  // If the importer is in node compatibility mode or this is not an ESM
+  // file that has been converted to a CommonJS file using a Babel-
+  // compatible transform (i.e. "__esModule" has not been set), then set
+  // "default" to the CommonJS "module.exports" for node compatibility.
+  isNodeMode || !mod || !mod.__esModule ? __defProp(target, "default", { value: mod, enumerable: true }) : target,
+  mod
+));
 
 // src/shims/bun-sqlite.ts
 import BetterSqlite3 from "better-sqlite3";
@@ -1200,7 +1223,7 @@ function getTimeline(db, anchorId, depthBefore = 5, depthAfter = 5) {
     SELECT id, 'observation' as type, title, text as content, project, created_at, created_at_epoch
     FROM observations WHERE id = ?
   `);
-  const self = selfStmt.all(anchorId);
+  const self2 = selfStmt.all(anchorId);
   const afterStmt = db.query(`
     SELECT id, 'observation' as type, title, text as content, project, created_at, created_at_epoch
     FROM observations
@@ -1209,7 +1232,7 @@ function getTimeline(db, anchorId, depthBefore = 5, depthAfter = 5) {
     LIMIT ?
   `);
   const after = afterStmt.all(anchorEpoch, anchorEpoch, anchorId, depthAfter);
-  return [...before, ...self, ...after];
+  return [...before, ...self2, ...after];
 }
 function getProjectStats(db, project) {
   const sql = `
@@ -2321,8 +2344,260 @@ var init_cli_utils = __esm({
       "backup.enabled": true,
       "backup.intervalHours": 24,
       "backup.maxKeep": 7,
-      "backup.compress": false
+      "backup.compress": false,
+      // Multi-user authentication (disabled by default = single-user mode)
+      "auth.enabled": false,
+      "auth.jwt_secret": ""
     };
+  }
+});
+
+// src/services/sqlite/adapters/claude-mem.ts
+import { createHash as createHash4 } from "node:crypto";
+function detectClaudeMemFormat(content) {
+  if (!content || content.trim().length === 0) return false;
+  const lines = content.split("\n");
+  const sampleSize = Math.min(10, lines.length);
+  let claudeMemLikeCount = 0;
+  let validJsonCount = 0;
+  for (let i = 0; i < lines.length && validJsonCount < sampleSize; i++) {
+    const line = lines[i]?.trim();
+    if (!line) continue;
+    let parsed;
+    try {
+      parsed = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (!parsed || typeof parsed !== "object") continue;
+    validJsonCount++;
+    const record = parsed;
+    if ("_meta" in record) continue;
+    if ("_type" in record) return false;
+    const isClaudeMem = typeof record["id"] === "string" && record["id"].startsWith("mem_") || record["type"] === "memory" && typeof record["content"] === "string" || record["type"] === "summary" && typeof record["content"] === "string" || record["type"] === "prompt" && typeof record["content"] === "string" || typeof record["content"] === "string" && (record["source"] === "user" || record["source"] === "assistant") && typeof record["created_at"] === "string";
+    if (isClaudeMem) claudeMemLikeCount++;
+  }
+  return validJsonCount > 0 && claudeMemLikeCount > 0 && claudeMemLikeCount / validJsonCount > 0.5;
+}
+function adaptClaudeMemToTotalRecall(content, options) {
+  const result = {
+    observations: [],
+    summaries: [],
+    prompts: [],
+    skipped: []
+  };
+  if (!content || content.trim().length === 0) return result;
+  const defaultProject = options?.defaultProject ?? DEFAULT_PROJECT;
+  const lines = content.split("\n");
+  let promptCounter = 0;
+  for (let i = 0; i < lines.length; i++) {
+    const raw = lines[i]?.trim();
+    if (!raw) continue;
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      result.skipped.push({
+        line: i + 1,
+        reason: `Invalid JSON: ${raw.substring(0, 60)}`
+      });
+      continue;
+    }
+    if (!parsed || typeof parsed !== "object") {
+      result.skipped.push({
+        line: i + 1,
+        reason: "Record is not a JSON object"
+      });
+      continue;
+    }
+    const record = parsed;
+    if (!record.content || record.content.trim().length === 0) {
+      result.skipped.push({
+        line: i + 1,
+        originalId: record.id,
+        type: record.type,
+        reason: "Empty content field"
+      });
+      continue;
+    }
+    const project = record.project || defaultProject;
+    const createdAt = record.created_at || (/* @__PURE__ */ new Date()).toISOString();
+    const createdAtEpoch = parseEpoch(createdAt);
+    const sessionId = generateSessionId(record.id, createdAt);
+    const provenance = buildProvenance(record);
+    const type = record.type ?? "memory";
+    switch (type) {
+      case "memory": {
+        const obs = adaptToObservation(record, {
+          project,
+          createdAt,
+          createdAtEpoch,
+          sessionId,
+          provenance
+        });
+        result.observations.push(obs);
+        break;
+      }
+      case "summary": {
+        const sum = adaptToSummary(record, {
+          project,
+          createdAt,
+          createdAtEpoch,
+          sessionId
+        });
+        result.summaries.push(sum);
+        break;
+      }
+      case "prompt": {
+        promptCounter++;
+        const pmt = adaptToPrompt(record, {
+          project,
+          createdAt,
+          createdAtEpoch,
+          sessionId,
+          promptNumber: promptCounter
+        });
+        result.prompts.push(pmt);
+        break;
+      }
+      default: {
+        result.skipped.push({
+          line: i + 1,
+          originalId: record.id,
+          type,
+          reason: `Unsupported type: "${type}". Only "memory", "summary", and "prompt" are supported.`
+        });
+        break;
+      }
+    }
+  }
+  return result;
+}
+function adaptToObservation(record, ctx) {
+  const content = record.content ?? "";
+  const firstNewline = content.indexOf("\n");
+  const title = firstNewline > 0 && firstNewline <= 200 ? content.substring(0, firstNewline).trim() : content.substring(0, 200).trim();
+  const narrative = content;
+  const concepts = record.tags && record.tags.length > 0 ? record.tags.join(", ") : null;
+  const contentHash = computeContentHash(ctx.project, "research", title, narrative);
+  return {
+    _type: "observation",
+    id: 0,
+    // Will be assigned on insert
+    memory_session_id: ctx.sessionId,
+    project: ctx.project,
+    type: "research",
+    title,
+    subtitle: null,
+    text: null,
+    narrative,
+    facts: ctx.provenance ?? null,
+    concepts,
+    files_read: null,
+    files_modified: null,
+    prompt_number: 0,
+    content_hash: contentHash,
+    discovery_tokens: estimateTokens(content),
+    auto_category: "imported",
+    created_at: ctx.createdAt,
+    created_at_epoch: ctx.createdAtEpoch
+  };
+}
+function adaptToSummary(record, ctx) {
+  const content = record.content ?? "";
+  return {
+    _type: "summary",
+    id: 0,
+    session_id: ctx.sessionId,
+    project: ctx.project,
+    request: null,
+    investigated: null,
+    learned: content,
+    completed: null,
+    next_steps: null,
+    notes: record.id ? `Imported from Claude Mem (${record.id})` : "Imported from Claude Mem",
+    discovery_tokens: estimateTokens(content),
+    created_at: ctx.createdAt,
+    created_at_epoch: ctx.createdAtEpoch
+  };
+}
+function adaptToPrompt(record, ctx) {
+  return {
+    _type: "prompt",
+    id: 0,
+    content_session_id: ctx.sessionId,
+    project: ctx.project,
+    prompt_number: ctx.promptNumber,
+    prompt_text: record.content ?? "",
+    created_at: ctx.createdAt,
+    created_at_epoch: ctx.createdAtEpoch
+  };
+}
+function buildProvenance(record) {
+  const provenance = {
+    _source: "claude-mem"
+  };
+  if (record.id) provenance["original_id"] = record.id;
+  if (record.source) provenance["source"] = record.source;
+  if (record.tags && record.tags.length > 0) provenance["tags"] = record.tags;
+  if (record.metadata) provenance["metadata"] = record.metadata;
+  return JSON.stringify(provenance);
+}
+function generateSessionId(id, createdAt) {
+  const datePart = createdAt.substring(0, 10);
+  return `${IMPORTED_SESSION_PREFIX}${datePart}`;
+}
+function computeContentHash(project, type, title, narrative) {
+  const payload = [project, type, title, narrative].join("|");
+  return createHash4("sha256").update(payload).digest("hex");
+}
+function parseEpoch(dateStr) {
+  const ts = Date.parse(dateStr);
+  return Number.isNaN(ts) ? Date.now() : ts;
+}
+function estimateTokens(text) {
+  return Math.ceil(text.length / 4);
+}
+var DEFAULT_PROJECT, IMPORTED_SESSION_PREFIX, claudeMemAdapter;
+var init_claude_mem = __esm({
+  "src/services/sqlite/adapters/claude-mem.ts"() {
+    "use strict";
+    DEFAULT_PROJECT = "claude-mem-import";
+    IMPORTED_SESSION_PREFIX = "claude-mem-";
+    claudeMemAdapter = {
+      name: "claude-mem",
+      detect: detectClaudeMemFormat,
+      adapt: adaptClaudeMemToTotalRecall
+    };
+  }
+});
+
+// src/services/sqlite/adapters/index.ts
+var adapters_exports = {};
+__export(adapters_exports, {
+  claudeMemAdapter: () => claudeMemAdapter,
+  detectAdapter: () => detectAdapter,
+  getAdapter: () => getAdapter,
+  listAdapters: () => listAdapters
+});
+function getAdapter(name) {
+  return adapters.find((a) => a.name === name);
+}
+function detectAdapter(content) {
+  return adapters.find((a) => a.detect(content));
+}
+function listAdapters() {
+  return adapters.map((a) => a.name);
+}
+var adapters;
+var init_adapters = __esm({
+  "src/services/sqlite/adapters/index.ts"() {
+    "use strict";
+    init_claude_mem();
+    init_claude_mem();
+    adapters = [
+      claudeMemAdapter
+    ];
   }
 });
 
@@ -2334,17 +2609,17 @@ __export(service_installer_exports, {
   status: () => status,
   uninstall: () => uninstall
 });
-import { execSync, spawnSync } from "child_process";
-import { join as join5, dirname as dirname2 } from "path";
-import { existsSync as existsSync6, writeFileSync as writeFileSync3, mkdirSync as mkdirSync5, unlinkSync as unlinkSync2 } from "fs";
-import { homedir as homedir2 } from "os";
+import { execSync as execSync2, spawnSync } from "child_process";
+import { join as join6, dirname as dirname2 } from "path";
+import { existsSync as existsSync7, writeFileSync as writeFileSync4, mkdirSync as mkdirSync6, unlinkSync as unlinkSync2 } from "fs";
+import { homedir as homedir3 } from "os";
 function resolveWorkerPath() {
   const candidates = [
-    join5(dirname2(new URL(import.meta.url).pathname), "..", "worker-service.js"),
-    join5(dirname2(new URL(import.meta.url).pathname), "worker-service.js")
+    join6(dirname2(new URL(import.meta.url).pathname), "..", "worker-service.js"),
+    join6(dirname2(new URL(import.meta.url).pathname), "worker-service.js")
   ];
   for (const p of candidates) {
-    if (existsSync6(p)) return p;
+    if (existsSync7(p)) return p;
   }
   return candidates[0];
 }
@@ -2379,16 +2654,16 @@ function detectStrategy() {
 }
 function getCrontab() {
   try {
-    return execSync("crontab -l 2>/dev/null", { encoding: "utf8" });
+    return execSync2("crontab -l 2>/dev/null", { encoding: "utf8" });
   } catch {
     return "";
   }
 }
 function setCrontab(content) {
-  const tmp = join5(DATA_DIR, ".crontab-tmp");
-  writeFileSync3(tmp, content, "utf8");
+  const tmp = join6(DATA_DIR, ".crontab-tmp");
+  writeFileSync4(tmp, content, "utf8");
   try {
-    execSync(`crontab "${tmp}"`, { stdio: "pipe" });
+    execSync2(`crontab "${tmp}"`, { stdio: "pipe" });
   } finally {
     try {
       unlinkSync2(tmp);
@@ -2422,10 +2697,10 @@ function uninstallCrontab() {
   return { strategy: "crontab", success: true, message: "Removed crontab @reboot entry." };
 }
 function getSystemdDir() {
-  return join5(homedir2(), ".config", "systemd", "user");
+  return join6(homedir3(), ".config", "systemd", "user");
 }
 function getServiceFilePath() {
-  return join5(getSystemdDir(), `${SYSTEMD_SERVICE_NAME}.service`);
+  return join6(getSystemdDir(), `${SYSTEMD_SERVICE_NAME}.service`);
 }
 function buildServiceFile() {
   const nodePath = getNodePath();
@@ -2442,7 +2717,7 @@ Restart=on-failure
 RestartSec=5
 StartLimitIntervalSec=60
 StartLimitBurst=3
-WorkingDirectory=${homedir2()}
+WorkingDirectory=${homedir3()}
 
 [Install]
 WantedBy=default.target
@@ -2450,13 +2725,13 @@ WantedBy=default.target
 }
 function installSystemd() {
   const dir = getSystemdDir();
-  mkdirSync5(dir, { recursive: true });
+  mkdirSync6(dir, { recursive: true });
   const servicePath = getServiceFilePath();
-  writeFileSync3(servicePath, buildServiceFile(), "utf8");
+  writeFileSync4(servicePath, buildServiceFile(), "utf8");
   try {
-    execSync("systemctl --user daemon-reload", { stdio: "pipe" });
-    execSync(`systemctl --user enable ${SYSTEMD_SERVICE_NAME}`, { stdio: "pipe" });
-    execSync(`systemctl --user start ${SYSTEMD_SERVICE_NAME}`, { stdio: "pipe" });
+    execSync2("systemctl --user daemon-reload", { stdio: "pipe" });
+    execSync2(`systemctl --user enable ${SYSTEMD_SERVICE_NAME}`, { stdio: "pipe" });
+    execSync2(`systemctl --user start ${SYSTEMD_SERVICE_NAME}`, { stdio: "pipe" });
   } catch (err) {
     return { strategy: "systemd", success: false, message: `Service file created but activation failed: ${err}` };
   }
@@ -2464,15 +2739,15 @@ function installSystemd() {
 }
 function uninstallSystemd() {
   try {
-    execSync(`systemctl --user stop ${SYSTEMD_SERVICE_NAME} 2>/dev/null`, { stdio: "pipe" });
-    execSync(`systemctl --user disable ${SYSTEMD_SERVICE_NAME} 2>/dev/null`, { stdio: "pipe" });
+    execSync2(`systemctl --user stop ${SYSTEMD_SERVICE_NAME} 2>/dev/null`, { stdio: "pipe" });
+    execSync2(`systemctl --user disable ${SYSTEMD_SERVICE_NAME} 2>/dev/null`, { stdio: "pipe" });
   } catch {
   }
   const servicePath = getServiceFilePath();
-  if (existsSync6(servicePath)) {
+  if (existsSync7(servicePath)) {
     unlinkSync2(servicePath);
     try {
-      execSync("systemctl --user daemon-reload", { stdio: "pipe" });
+      execSync2("systemctl --user daemon-reload", { stdio: "pipe" });
     } catch {
     }
   }
@@ -2491,7 +2766,7 @@ function install() {
 }
 function uninstall() {
   const results = [];
-  if (existsSync6(getServiceFilePath())) {
+  if (existsSync7(getServiceFilePath())) {
     results.push(uninstallSystemd());
   }
   const crontab = getCrontab();
@@ -2504,9 +2779,9 @@ function uninstall() {
   return results[results.length - 1];
 }
 function status() {
-  if (existsSync6(getServiceFilePath())) {
+  if (existsSync7(getServiceFilePath())) {
     try {
-      const out = execSync(`systemctl --user is-active ${SYSTEMD_SERVICE_NAME} 2>/dev/null`, { encoding: "utf8" }).trim();
+      const out = execSync2(`systemctl --user is-active ${SYSTEMD_SERVICE_NAME} 2>/dev/null`, { encoding: "utf8" }).trim();
       return { installed: true, strategy: "systemd", running: out === "active", details: `systemd: ${out}` };
     } catch {
       return { installed: true, strategy: "systemd", running: false, details: "systemd: inactive or bus unavailable" };
@@ -2525,6 +2800,1962 @@ var init_service_installer = __esm({
     init_paths();
     CRONTAB_MARKER = "# totalrecall-worker-autostart";
     SYSTEMD_SERVICE_NAME = "totalrecall-worker";
+  }
+});
+
+// src/services/sqlite/Users.ts
+var Users_exports = {};
+__export(Users_exports, {
+  cleanExpiredSessions: () => cleanExpiredSessions,
+  countAdmins: () => countAdmins,
+  createAuthSession: () => createAuthSession,
+  createUser: () => createUser,
+  deactivateUser: () => deactivateUser,
+  deleteAuthSession: () => deleteAuthSession,
+  deleteUserSessions: () => deleteUserSessions,
+  getAuditLog: () => getAuditLog,
+  getSessionByRefreshToken: () => getSessionByRefreshToken,
+  getUserByEmail: () => getUserByEmail,
+  getUserById: () => getUserById,
+  isValidRole: () => isValidRole,
+  listUsers: () => listUsers,
+  logAction: () => logAction,
+  toPublicUser: () => toPublicUser,
+  updateUserLastLogin: () => updateUserLastLogin,
+  updateUserRole: () => updateUserRole
+});
+import crypto from "crypto";
+function createUser(db, email, passwordHash, role, displayName) {
+  const id = crypto.randomUUID();
+  const now = (/* @__PURE__ */ new Date()).toISOString();
+  db.run(
+    `INSERT INTO users (id, email, password_hash, role, display_name, avatar_url, is_active, created_at, last_login)
+     VALUES (?, ?, ?, ?, ?, NULL, 1, ?, NULL)`,
+    [id, email, passwordHash, role, displayName, now]
+  );
+  return {
+    id,
+    email,
+    password_hash: passwordHash,
+    role,
+    display_name: displayName,
+    avatar_url: null,
+    is_active: 1,
+    created_at: now,
+    last_login: null
+  };
+}
+function getUserByEmail(db, email) {
+  const query = db.query("SELECT * FROM users WHERE email = ? AND is_active = 1");
+  return query.get(email);
+}
+function getUserById(db, id) {
+  const query = db.query("SELECT * FROM users WHERE id = ?");
+  return query.get(id);
+}
+function listUsers(db) {
+  const query = db.query(
+    "SELECT id, email, role, display_name, avatar_url, is_active, created_at, last_login FROM users ORDER BY created_at ASC"
+  );
+  return query.all();
+}
+function updateUserRole(db, id, role) {
+  const result = db.run("UPDATE users SET role = ? WHERE id = ?", [role, id]);
+  return result.changes > 0;
+}
+function updateUserLastLogin(db, id) {
+  db.run("UPDATE users SET last_login = ? WHERE id = ?", [(/* @__PURE__ */ new Date()).toISOString(), id]);
+}
+function deactivateUser(db, id) {
+  const result = db.run("UPDATE users SET is_active = 0 WHERE id = ?", [id]);
+  return result.changes > 0;
+}
+function countAdmins(db) {
+  const query = db.query("SELECT COUNT(*) as count FROM users WHERE role = 'admin' AND is_active = 1");
+  const row = query.get();
+  return row?.count ?? 0;
+}
+function createAuthSession(db, userId, token, refreshToken, expiresAt, refreshExpiresAt) {
+  const id = crypto.randomUUID();
+  const now = (/* @__PURE__ */ new Date()).toISOString();
+  db.run(
+    `INSERT INTO sessions_auth (id, user_id, token, refresh_token, expires_at, refresh_expires_at, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    [id, userId, token, refreshToken, expiresAt, refreshExpiresAt, now]
+  );
+  return { id, user_id: userId, token, refresh_token: refreshToken, expires_at: expiresAt, refresh_expires_at: refreshExpiresAt, created_at: now };
+}
+function getSessionByRefreshToken(db, refreshToken) {
+  const query = db.query("SELECT * FROM sessions_auth WHERE refresh_token = ?");
+  return query.get(refreshToken);
+}
+function deleteAuthSession(db, token) {
+  db.run("DELETE FROM sessions_auth WHERE token = ?", [token]);
+}
+function deleteUserSessions(db, userId) {
+  db.run("DELETE FROM sessions_auth WHERE user_id = ?", [userId]);
+}
+function cleanExpiredSessions(db) {
+  const now = (/* @__PURE__ */ new Date()).toISOString();
+  const result = db.run("DELETE FROM sessions_auth WHERE refresh_expires_at < ?", [now]);
+  return result.changes;
+}
+function logAction(db, userId, action, target = null, details = null, ipAddress = null) {
+  const now = (/* @__PURE__ */ new Date()).toISOString();
+  db.run(
+    `INSERT INTO audit_log (user_id, action, target, details, ip_address, timestamp)
+     VALUES (?, ?, ?, ?, ?, ?)`,
+    [userId, action, target, details, ipAddress, now]
+  );
+}
+function getAuditLog(db, limit = 100, offset = 0) {
+  const query = db.query(`
+    SELECT a.id, a.user_id, u.email as user_email, a.action, a.target, a.details, a.ip_address, a.timestamp
+    FROM audit_log a
+    LEFT JOIN users u ON a.user_id = u.id
+    ORDER BY a.timestamp DESC
+    LIMIT ? OFFSET ?
+  `);
+  return query.all(limit, offset);
+}
+function toPublicUser(user) {
+  return {
+    id: user.id,
+    email: user.email,
+    role: user.role,
+    display_name: user.display_name,
+    avatar_url: user.avatar_url,
+    is_active: user.is_active,
+    created_at: user.created_at,
+    last_login: user.last_login
+  };
+}
+function isValidRole(role) {
+  return typeof role === "string" && VALID_ROLES.has(role);
+}
+var VALID_ROLES;
+var init_Users = __esm({
+  "src/services/sqlite/Users.ts"() {
+    "use strict";
+    VALID_ROLES = /* @__PURE__ */ new Set(["admin", "editor", "viewer"]);
+  }
+});
+
+// node_modules/bcryptjs/dist/bcrypt.js
+var require_bcrypt = __commonJS({
+  "node_modules/bcryptjs/dist/bcrypt.js"(exports, module) {
+    (function(global, factory) {
+      if (typeof define === "function" && define["amd"])
+        define([], factory);
+      else if (typeof __require === "function" && typeof module === "object" && module && module["exports"])
+        module["exports"] = factory();
+      else
+        (global["dcodeIO"] = global["dcodeIO"] || {})["bcrypt"] = factory();
+    })(exports, function() {
+      "use strict";
+      var bcrypt = {};
+      var randomFallback = null;
+      function random(len) {
+        if (typeof module !== "undefined" && module && module["exports"])
+          try {
+            return __require("crypto")["randomBytes"](len);
+          } catch (e) {
+          }
+        try {
+          var a;
+          (self["crypto"] || self["msCrypto"])["getRandomValues"](a = new Uint32Array(len));
+          return Array.prototype.slice.call(a);
+        } catch (e) {
+        }
+        if (!randomFallback)
+          throw Error("Neither WebCryptoAPI nor a crypto module is available. Use bcrypt.setRandomFallback to set an alternative");
+        return randomFallback(len);
+      }
+      var randomAvailable = false;
+      try {
+        random(1);
+        randomAvailable = true;
+      } catch (e) {
+      }
+      randomFallback = null;
+      bcrypt.setRandomFallback = function(random2) {
+        randomFallback = random2;
+      };
+      bcrypt.genSaltSync = function(rounds, seed_length) {
+        rounds = rounds || GENSALT_DEFAULT_LOG2_ROUNDS;
+        if (typeof rounds !== "number")
+          throw Error("Illegal arguments: " + typeof rounds + ", " + typeof seed_length);
+        if (rounds < 4)
+          rounds = 4;
+        else if (rounds > 31)
+          rounds = 31;
+        var salt = [];
+        salt.push("$2a$");
+        if (rounds < 10)
+          salt.push("0");
+        salt.push(rounds.toString());
+        salt.push("$");
+        salt.push(base64_encode(random(BCRYPT_SALT_LEN), BCRYPT_SALT_LEN));
+        return salt.join("");
+      };
+      bcrypt.genSalt = function(rounds, seed_length, callback) {
+        if (typeof seed_length === "function")
+          callback = seed_length, seed_length = void 0;
+        if (typeof rounds === "function")
+          callback = rounds, rounds = void 0;
+        if (typeof rounds === "undefined")
+          rounds = GENSALT_DEFAULT_LOG2_ROUNDS;
+        else if (typeof rounds !== "number")
+          throw Error("illegal arguments: " + typeof rounds);
+        function _async(callback2) {
+          nextTick(function() {
+            try {
+              callback2(null, bcrypt.genSaltSync(rounds));
+            } catch (err) {
+              callback2(err);
+            }
+          });
+        }
+        if (callback) {
+          if (typeof callback !== "function")
+            throw Error("Illegal callback: " + typeof callback);
+          _async(callback);
+        } else
+          return new Promise(function(resolve, reject) {
+            _async(function(err, res) {
+              if (err) {
+                reject(err);
+                return;
+              }
+              resolve(res);
+            });
+          });
+      };
+      bcrypt.hashSync = function(s, salt) {
+        if (typeof salt === "undefined")
+          salt = GENSALT_DEFAULT_LOG2_ROUNDS;
+        if (typeof salt === "number")
+          salt = bcrypt.genSaltSync(salt);
+        if (typeof s !== "string" || typeof salt !== "string")
+          throw Error("Illegal arguments: " + typeof s + ", " + typeof salt);
+        return _hash(s, salt);
+      };
+      bcrypt.hash = function(s, salt, callback, progressCallback) {
+        function _async(callback2) {
+          if (typeof s === "string" && typeof salt === "number")
+            bcrypt.genSalt(salt, function(err, salt2) {
+              _hash(s, salt2, callback2, progressCallback);
+            });
+          else if (typeof s === "string" && typeof salt === "string")
+            _hash(s, salt, callback2, progressCallback);
+          else
+            nextTick(callback2.bind(this, Error("Illegal arguments: " + typeof s + ", " + typeof salt)));
+        }
+        if (callback) {
+          if (typeof callback !== "function")
+            throw Error("Illegal callback: " + typeof callback);
+          _async(callback);
+        } else
+          return new Promise(function(resolve, reject) {
+            _async(function(err, res) {
+              if (err) {
+                reject(err);
+                return;
+              }
+              resolve(res);
+            });
+          });
+      };
+      function safeStringCompare(known, unknown) {
+        var right = 0, wrong = 0;
+        for (var i = 0, k = known.length; i < k; ++i) {
+          if (known.charCodeAt(i) === unknown.charCodeAt(i))
+            ++right;
+          else
+            ++wrong;
+        }
+        if (right < 0)
+          return false;
+        return wrong === 0;
+      }
+      bcrypt.compareSync = function(s, hash) {
+        if (typeof s !== "string" || typeof hash !== "string")
+          throw Error("Illegal arguments: " + typeof s + ", " + typeof hash);
+        if (hash.length !== 60)
+          return false;
+        return safeStringCompare(bcrypt.hashSync(s, hash.substr(0, hash.length - 31)), hash);
+      };
+      bcrypt.compare = function(s, hash, callback, progressCallback) {
+        function _async(callback2) {
+          if (typeof s !== "string" || typeof hash !== "string") {
+            nextTick(callback2.bind(this, Error("Illegal arguments: " + typeof s + ", " + typeof hash)));
+            return;
+          }
+          if (hash.length !== 60) {
+            nextTick(callback2.bind(this, null, false));
+            return;
+          }
+          bcrypt.hash(s, hash.substr(0, 29), function(err, comp) {
+            if (err)
+              callback2(err);
+            else
+              callback2(null, safeStringCompare(comp, hash));
+          }, progressCallback);
+        }
+        if (callback) {
+          if (typeof callback !== "function")
+            throw Error("Illegal callback: " + typeof callback);
+          _async(callback);
+        } else
+          return new Promise(function(resolve, reject) {
+            _async(function(err, res) {
+              if (err) {
+                reject(err);
+                return;
+              }
+              resolve(res);
+            });
+          });
+      };
+      bcrypt.getRounds = function(hash) {
+        if (typeof hash !== "string")
+          throw Error("Illegal arguments: " + typeof hash);
+        return parseInt(hash.split("$")[2], 10);
+      };
+      bcrypt.getSalt = function(hash) {
+        if (typeof hash !== "string")
+          throw Error("Illegal arguments: " + typeof hash);
+        if (hash.length !== 60)
+          throw Error("Illegal hash length: " + hash.length + " != 60");
+        return hash.substring(0, 29);
+      };
+      var nextTick = typeof process !== "undefined" && process && typeof process.nextTick === "function" ? typeof setImmediate === "function" ? setImmediate : process.nextTick : setTimeout;
+      function stringToBytes(str) {
+        var out = [], i = 0;
+        utfx.encodeUTF16toUTF8(function() {
+          if (i >= str.length) return null;
+          return str.charCodeAt(i++);
+        }, function(b) {
+          out.push(b);
+        });
+        return out;
+      }
+      var BASE64_CODE = "./ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789".split("");
+      var BASE64_INDEX = [
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+        0,
+        1,
+        54,
+        55,
+        56,
+        57,
+        58,
+        59,
+        60,
+        61,
+        62,
+        63,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+        28,
+        29,
+        30,
+        31,
+        32,
+        33,
+        34,
+        35,
+        36,
+        37,
+        38,
+        39,
+        40,
+        41,
+        42,
+        43,
+        44,
+        45,
+        46,
+        47,
+        48,
+        49,
+        50,
+        51,
+        52,
+        53,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1
+      ];
+      var stringFromCharCode = String.fromCharCode;
+      function base64_encode(b, len) {
+        var off = 0, rs = [], c1, c2;
+        if (len <= 0 || len > b.length)
+          throw Error("Illegal len: " + len);
+        while (off < len) {
+          c1 = b[off++] & 255;
+          rs.push(BASE64_CODE[c1 >> 2 & 63]);
+          c1 = (c1 & 3) << 4;
+          if (off >= len) {
+            rs.push(BASE64_CODE[c1 & 63]);
+            break;
+          }
+          c2 = b[off++] & 255;
+          c1 |= c2 >> 4 & 15;
+          rs.push(BASE64_CODE[c1 & 63]);
+          c1 = (c2 & 15) << 2;
+          if (off >= len) {
+            rs.push(BASE64_CODE[c1 & 63]);
+            break;
+          }
+          c2 = b[off++] & 255;
+          c1 |= c2 >> 6 & 3;
+          rs.push(BASE64_CODE[c1 & 63]);
+          rs.push(BASE64_CODE[c2 & 63]);
+        }
+        return rs.join("");
+      }
+      function base64_decode(s, len) {
+        var off = 0, slen = s.length, olen = 0, rs = [], c1, c2, c3, c4, o, code;
+        if (len <= 0)
+          throw Error("Illegal len: " + len);
+        while (off < slen - 1 && olen < len) {
+          code = s.charCodeAt(off++);
+          c1 = code < BASE64_INDEX.length ? BASE64_INDEX[code] : -1;
+          code = s.charCodeAt(off++);
+          c2 = code < BASE64_INDEX.length ? BASE64_INDEX[code] : -1;
+          if (c1 == -1 || c2 == -1)
+            break;
+          o = c1 << 2 >>> 0;
+          o |= (c2 & 48) >> 4;
+          rs.push(stringFromCharCode(o));
+          if (++olen >= len || off >= slen)
+            break;
+          code = s.charCodeAt(off++);
+          c3 = code < BASE64_INDEX.length ? BASE64_INDEX[code] : -1;
+          if (c3 == -1)
+            break;
+          o = (c2 & 15) << 4 >>> 0;
+          o |= (c3 & 60) >> 2;
+          rs.push(stringFromCharCode(o));
+          if (++olen >= len || off >= slen)
+            break;
+          code = s.charCodeAt(off++);
+          c4 = code < BASE64_INDEX.length ? BASE64_INDEX[code] : -1;
+          o = (c3 & 3) << 6 >>> 0;
+          o |= c4;
+          rs.push(stringFromCharCode(o));
+          ++olen;
+        }
+        var res = [];
+        for (off = 0; off < olen; off++)
+          res.push(rs[off].charCodeAt(0));
+        return res;
+      }
+      var utfx = (function() {
+        "use strict";
+        var utfx2 = {};
+        utfx2.MAX_CODEPOINT = 1114111;
+        utfx2.encodeUTF8 = function(src, dst) {
+          var cp = null;
+          if (typeof src === "number")
+            cp = src, src = function() {
+              return null;
+            };
+          while (cp !== null || (cp = src()) !== null) {
+            if (cp < 128)
+              dst(cp & 127);
+            else if (cp < 2048)
+              dst(cp >> 6 & 31 | 192), dst(cp & 63 | 128);
+            else if (cp < 65536)
+              dst(cp >> 12 & 15 | 224), dst(cp >> 6 & 63 | 128), dst(cp & 63 | 128);
+            else
+              dst(cp >> 18 & 7 | 240), dst(cp >> 12 & 63 | 128), dst(cp >> 6 & 63 | 128), dst(cp & 63 | 128);
+            cp = null;
+          }
+        };
+        utfx2.decodeUTF8 = function(src, dst) {
+          var a, b, c, d, fail = function(b2) {
+            b2 = b2.slice(0, b2.indexOf(null));
+            var err = Error(b2.toString());
+            err.name = "TruncatedError";
+            err["bytes"] = b2;
+            throw err;
+          };
+          while ((a = src()) !== null) {
+            if ((a & 128) === 0)
+              dst(a);
+            else if ((a & 224) === 192)
+              (b = src()) === null && fail([a, b]), dst((a & 31) << 6 | b & 63);
+            else if ((a & 240) === 224)
+              ((b = src()) === null || (c = src()) === null) && fail([a, b, c]), dst((a & 15) << 12 | (b & 63) << 6 | c & 63);
+            else if ((a & 248) === 240)
+              ((b = src()) === null || (c = src()) === null || (d = src()) === null) && fail([a, b, c, d]), dst((a & 7) << 18 | (b & 63) << 12 | (c & 63) << 6 | d & 63);
+            else throw RangeError("Illegal starting byte: " + a);
+          }
+        };
+        utfx2.UTF16toUTF8 = function(src, dst) {
+          var c1, c2 = null;
+          while (true) {
+            if ((c1 = c2 !== null ? c2 : src()) === null)
+              break;
+            if (c1 >= 55296 && c1 <= 57343) {
+              if ((c2 = src()) !== null) {
+                if (c2 >= 56320 && c2 <= 57343) {
+                  dst((c1 - 55296) * 1024 + c2 - 56320 + 65536);
+                  c2 = null;
+                  continue;
+                }
+              }
+            }
+            dst(c1);
+          }
+          if (c2 !== null) dst(c2);
+        };
+        utfx2.UTF8toUTF16 = function(src, dst) {
+          var cp = null;
+          if (typeof src === "number")
+            cp = src, src = function() {
+              return null;
+            };
+          while (cp !== null || (cp = src()) !== null) {
+            if (cp <= 65535)
+              dst(cp);
+            else
+              cp -= 65536, dst((cp >> 10) + 55296), dst(cp % 1024 + 56320);
+            cp = null;
+          }
+        };
+        utfx2.encodeUTF16toUTF8 = function(src, dst) {
+          utfx2.UTF16toUTF8(src, function(cp) {
+            utfx2.encodeUTF8(cp, dst);
+          });
+        };
+        utfx2.decodeUTF8toUTF16 = function(src, dst) {
+          utfx2.decodeUTF8(src, function(cp) {
+            utfx2.UTF8toUTF16(cp, dst);
+          });
+        };
+        utfx2.calculateCodePoint = function(cp) {
+          return cp < 128 ? 1 : cp < 2048 ? 2 : cp < 65536 ? 3 : 4;
+        };
+        utfx2.calculateUTF8 = function(src) {
+          var cp, l = 0;
+          while ((cp = src()) !== null)
+            l += utfx2.calculateCodePoint(cp);
+          return l;
+        };
+        utfx2.calculateUTF16asUTF8 = function(src) {
+          var n = 0, l = 0;
+          utfx2.UTF16toUTF8(src, function(cp) {
+            ++n;
+            l += utfx2.calculateCodePoint(cp);
+          });
+          return [n, l];
+        };
+        return utfx2;
+      })();
+      Date.now = Date.now || function() {
+        return +/* @__PURE__ */ new Date();
+      };
+      var BCRYPT_SALT_LEN = 16;
+      var GENSALT_DEFAULT_LOG2_ROUNDS = 10;
+      var BLOWFISH_NUM_ROUNDS = 16;
+      var MAX_EXECUTION_TIME = 100;
+      var P_ORIG = [
+        608135816,
+        2242054355,
+        320440878,
+        57701188,
+        2752067618,
+        698298832,
+        137296536,
+        3964562569,
+        1160258022,
+        953160567,
+        3193202383,
+        887688300,
+        3232508343,
+        3380367581,
+        1065670069,
+        3041331479,
+        2450970073,
+        2306472731
+      ];
+      var S_ORIG = [
+        3509652390,
+        2564797868,
+        805139163,
+        3491422135,
+        3101798381,
+        1780907670,
+        3128725573,
+        4046225305,
+        614570311,
+        3012652279,
+        134345442,
+        2240740374,
+        1667834072,
+        1901547113,
+        2757295779,
+        4103290238,
+        227898511,
+        1921955416,
+        1904987480,
+        2182433518,
+        2069144605,
+        3260701109,
+        2620446009,
+        720527379,
+        3318853667,
+        677414384,
+        3393288472,
+        3101374703,
+        2390351024,
+        1614419982,
+        1822297739,
+        2954791486,
+        3608508353,
+        3174124327,
+        2024746970,
+        1432378464,
+        3864339955,
+        2857741204,
+        1464375394,
+        1676153920,
+        1439316330,
+        715854006,
+        3033291828,
+        289532110,
+        2706671279,
+        2087905683,
+        3018724369,
+        1668267050,
+        732546397,
+        1947742710,
+        3462151702,
+        2609353502,
+        2950085171,
+        1814351708,
+        2050118529,
+        680887927,
+        999245976,
+        1800124847,
+        3300911131,
+        1713906067,
+        1641548236,
+        4213287313,
+        1216130144,
+        1575780402,
+        4018429277,
+        3917837745,
+        3693486850,
+        3949271944,
+        596196993,
+        3549867205,
+        258830323,
+        2213823033,
+        772490370,
+        2760122372,
+        1774776394,
+        2652871518,
+        566650946,
+        4142492826,
+        1728879713,
+        2882767088,
+        1783734482,
+        3629395816,
+        2517608232,
+        2874225571,
+        1861159788,
+        326777828,
+        3124490320,
+        2130389656,
+        2716951837,
+        967770486,
+        1724537150,
+        2185432712,
+        2364442137,
+        1164943284,
+        2105845187,
+        998989502,
+        3765401048,
+        2244026483,
+        1075463327,
+        1455516326,
+        1322494562,
+        910128902,
+        469688178,
+        1117454909,
+        936433444,
+        3490320968,
+        3675253459,
+        1240580251,
+        122909385,
+        2157517691,
+        634681816,
+        4142456567,
+        3825094682,
+        3061402683,
+        2540495037,
+        79693498,
+        3249098678,
+        1084186820,
+        1583128258,
+        426386531,
+        1761308591,
+        1047286709,
+        322548459,
+        995290223,
+        1845252383,
+        2603652396,
+        3431023940,
+        2942221577,
+        3202600964,
+        3727903485,
+        1712269319,
+        422464435,
+        3234572375,
+        1170764815,
+        3523960633,
+        3117677531,
+        1434042557,
+        442511882,
+        3600875718,
+        1076654713,
+        1738483198,
+        4213154764,
+        2393238008,
+        3677496056,
+        1014306527,
+        4251020053,
+        793779912,
+        2902807211,
+        842905082,
+        4246964064,
+        1395751752,
+        1040244610,
+        2656851899,
+        3396308128,
+        445077038,
+        3742853595,
+        3577915638,
+        679411651,
+        2892444358,
+        2354009459,
+        1767581616,
+        3150600392,
+        3791627101,
+        3102740896,
+        284835224,
+        4246832056,
+        1258075500,
+        768725851,
+        2589189241,
+        3069724005,
+        3532540348,
+        1274779536,
+        3789419226,
+        2764799539,
+        1660621633,
+        3471099624,
+        4011903706,
+        913787905,
+        3497959166,
+        737222580,
+        2514213453,
+        2928710040,
+        3937242737,
+        1804850592,
+        3499020752,
+        2949064160,
+        2386320175,
+        2390070455,
+        2415321851,
+        4061277028,
+        2290661394,
+        2416832540,
+        1336762016,
+        1754252060,
+        3520065937,
+        3014181293,
+        791618072,
+        3188594551,
+        3933548030,
+        2332172193,
+        3852520463,
+        3043980520,
+        413987798,
+        3465142937,
+        3030929376,
+        4245938359,
+        2093235073,
+        3534596313,
+        375366246,
+        2157278981,
+        2479649556,
+        555357303,
+        3870105701,
+        2008414854,
+        3344188149,
+        4221384143,
+        3956125452,
+        2067696032,
+        3594591187,
+        2921233993,
+        2428461,
+        544322398,
+        577241275,
+        1471733935,
+        610547355,
+        4027169054,
+        1432588573,
+        1507829418,
+        2025931657,
+        3646575487,
+        545086370,
+        48609733,
+        2200306550,
+        1653985193,
+        298326376,
+        1316178497,
+        3007786442,
+        2064951626,
+        458293330,
+        2589141269,
+        3591329599,
+        3164325604,
+        727753846,
+        2179363840,
+        146436021,
+        1461446943,
+        4069977195,
+        705550613,
+        3059967265,
+        3887724982,
+        4281599278,
+        3313849956,
+        1404054877,
+        2845806497,
+        146425753,
+        1854211946,
+        1266315497,
+        3048417604,
+        3681880366,
+        3289982499,
+        290971e4,
+        1235738493,
+        2632868024,
+        2414719590,
+        3970600049,
+        1771706367,
+        1449415276,
+        3266420449,
+        422970021,
+        1963543593,
+        2690192192,
+        3826793022,
+        1062508698,
+        1531092325,
+        1804592342,
+        2583117782,
+        2714934279,
+        4024971509,
+        1294809318,
+        4028980673,
+        1289560198,
+        2221992742,
+        1669523910,
+        35572830,
+        157838143,
+        1052438473,
+        1016535060,
+        1802137761,
+        1753167236,
+        1386275462,
+        3080475397,
+        2857371447,
+        1040679964,
+        2145300060,
+        2390574316,
+        1461121720,
+        2956646967,
+        4031777805,
+        4028374788,
+        33600511,
+        2920084762,
+        1018524850,
+        629373528,
+        3691585981,
+        3515945977,
+        2091462646,
+        2486323059,
+        586499841,
+        988145025,
+        935516892,
+        3367335476,
+        2599673255,
+        2839830854,
+        265290510,
+        3972581182,
+        2759138881,
+        3795373465,
+        1005194799,
+        847297441,
+        406762289,
+        1314163512,
+        1332590856,
+        1866599683,
+        4127851711,
+        750260880,
+        613907577,
+        1450815602,
+        3165620655,
+        3734664991,
+        3650291728,
+        3012275730,
+        3704569646,
+        1427272223,
+        778793252,
+        1343938022,
+        2676280711,
+        2052605720,
+        1946737175,
+        3164576444,
+        3914038668,
+        3967478842,
+        3682934266,
+        1661551462,
+        3294938066,
+        4011595847,
+        840292616,
+        3712170807,
+        616741398,
+        312560963,
+        711312465,
+        1351876610,
+        322626781,
+        1910503582,
+        271666773,
+        2175563734,
+        1594956187,
+        70604529,
+        3617834859,
+        1007753275,
+        1495573769,
+        4069517037,
+        2549218298,
+        2663038764,
+        504708206,
+        2263041392,
+        3941167025,
+        2249088522,
+        1514023603,
+        1998579484,
+        1312622330,
+        694541497,
+        2582060303,
+        2151582166,
+        1382467621,
+        776784248,
+        2618340202,
+        3323268794,
+        2497899128,
+        2784771155,
+        503983604,
+        4076293799,
+        907881277,
+        423175695,
+        432175456,
+        1378068232,
+        4145222326,
+        3954048622,
+        3938656102,
+        3820766613,
+        2793130115,
+        2977904593,
+        26017576,
+        3274890735,
+        3194772133,
+        1700274565,
+        1756076034,
+        4006520079,
+        3677328699,
+        720338349,
+        1533947780,
+        354530856,
+        688349552,
+        3973924725,
+        1637815568,
+        332179504,
+        3949051286,
+        53804574,
+        2852348879,
+        3044236432,
+        1282449977,
+        3583942155,
+        3416972820,
+        4006381244,
+        1617046695,
+        2628476075,
+        3002303598,
+        1686838959,
+        431878346,
+        2686675385,
+        1700445008,
+        1080580658,
+        1009431731,
+        832498133,
+        3223435511,
+        2605976345,
+        2271191193,
+        2516031870,
+        1648197032,
+        4164389018,
+        2548247927,
+        300782431,
+        375919233,
+        238389289,
+        3353747414,
+        2531188641,
+        2019080857,
+        1475708069,
+        455242339,
+        2609103871,
+        448939670,
+        3451063019,
+        1395535956,
+        2413381860,
+        1841049896,
+        1491858159,
+        885456874,
+        4264095073,
+        4001119347,
+        1565136089,
+        3898914787,
+        1108368660,
+        540939232,
+        1173283510,
+        2745871338,
+        3681308437,
+        4207628240,
+        3343053890,
+        4016749493,
+        1699691293,
+        1103962373,
+        3625875870,
+        2256883143,
+        3830138730,
+        1031889488,
+        3479347698,
+        1535977030,
+        4236805024,
+        3251091107,
+        2132092099,
+        1774941330,
+        1199868427,
+        1452454533,
+        157007616,
+        2904115357,
+        342012276,
+        595725824,
+        1480756522,
+        206960106,
+        497939518,
+        591360097,
+        863170706,
+        2375253569,
+        3596610801,
+        1814182875,
+        2094937945,
+        3421402208,
+        1082520231,
+        3463918190,
+        2785509508,
+        435703966,
+        3908032597,
+        1641649973,
+        2842273706,
+        3305899714,
+        1510255612,
+        2148256476,
+        2655287854,
+        3276092548,
+        4258621189,
+        236887753,
+        3681803219,
+        274041037,
+        1734335097,
+        3815195456,
+        3317970021,
+        1899903192,
+        1026095262,
+        4050517792,
+        356393447,
+        2410691914,
+        3873677099,
+        3682840055,
+        3913112168,
+        2491498743,
+        4132185628,
+        2489919796,
+        1091903735,
+        1979897079,
+        3170134830,
+        3567386728,
+        3557303409,
+        857797738,
+        1136121015,
+        1342202287,
+        507115054,
+        2535736646,
+        337727348,
+        3213592640,
+        1301675037,
+        2528481711,
+        1895095763,
+        1721773893,
+        3216771564,
+        62756741,
+        2142006736,
+        835421444,
+        2531993523,
+        1442658625,
+        3659876326,
+        2882144922,
+        676362277,
+        1392781812,
+        170690266,
+        3921047035,
+        1759253602,
+        3611846912,
+        1745797284,
+        664899054,
+        1329594018,
+        3901205900,
+        3045908486,
+        2062866102,
+        2865634940,
+        3543621612,
+        3464012697,
+        1080764994,
+        553557557,
+        3656615353,
+        3996768171,
+        991055499,
+        499776247,
+        1265440854,
+        648242737,
+        3940784050,
+        980351604,
+        3713745714,
+        1749149687,
+        3396870395,
+        4211799374,
+        3640570775,
+        1161844396,
+        3125318951,
+        1431517754,
+        545492359,
+        4268468663,
+        3499529547,
+        1437099964,
+        2702547544,
+        3433638243,
+        2581715763,
+        2787789398,
+        1060185593,
+        1593081372,
+        2418618748,
+        4260947970,
+        69676912,
+        2159744348,
+        86519011,
+        2512459080,
+        3838209314,
+        1220612927,
+        3339683548,
+        133810670,
+        1090789135,
+        1078426020,
+        1569222167,
+        845107691,
+        3583754449,
+        4072456591,
+        1091646820,
+        628848692,
+        1613405280,
+        3757631651,
+        526609435,
+        236106946,
+        48312990,
+        2942717905,
+        3402727701,
+        1797494240,
+        859738849,
+        992217954,
+        4005476642,
+        2243076622,
+        3870952857,
+        3732016268,
+        765654824,
+        3490871365,
+        2511836413,
+        1685915746,
+        3888969200,
+        1414112111,
+        2273134842,
+        3281911079,
+        4080962846,
+        172450625,
+        2569994100,
+        980381355,
+        4109958455,
+        2819808352,
+        2716589560,
+        2568741196,
+        3681446669,
+        3329971472,
+        1835478071,
+        660984891,
+        3704678404,
+        4045999559,
+        3422617507,
+        3040415634,
+        1762651403,
+        1719377915,
+        3470491036,
+        2693910283,
+        3642056355,
+        3138596744,
+        1364962596,
+        2073328063,
+        1983633131,
+        926494387,
+        3423689081,
+        2150032023,
+        4096667949,
+        1749200295,
+        3328846651,
+        309677260,
+        2016342300,
+        1779581495,
+        3079819751,
+        111262694,
+        1274766160,
+        443224088,
+        298511866,
+        1025883608,
+        3806446537,
+        1145181785,
+        168956806,
+        3641502830,
+        3584813610,
+        1689216846,
+        3666258015,
+        3200248200,
+        1692713982,
+        2646376535,
+        4042768518,
+        1618508792,
+        1610833997,
+        3523052358,
+        4130873264,
+        2001055236,
+        3610705100,
+        2202168115,
+        4028541809,
+        2961195399,
+        1006657119,
+        2006996926,
+        3186142756,
+        1430667929,
+        3210227297,
+        1314452623,
+        4074634658,
+        4101304120,
+        2273951170,
+        1399257539,
+        3367210612,
+        3027628629,
+        1190975929,
+        2062231137,
+        2333990788,
+        2221543033,
+        2438960610,
+        1181637006,
+        548689776,
+        2362791313,
+        3372408396,
+        3104550113,
+        3145860560,
+        296247880,
+        1970579870,
+        3078560182,
+        3769228297,
+        1714227617,
+        3291629107,
+        3898220290,
+        166772364,
+        1251581989,
+        493813264,
+        448347421,
+        195405023,
+        2709975567,
+        677966185,
+        3703036547,
+        1463355134,
+        2715995803,
+        1338867538,
+        1343315457,
+        2802222074,
+        2684532164,
+        233230375,
+        2599980071,
+        2000651841,
+        3277868038,
+        1638401717,
+        4028070440,
+        3237316320,
+        6314154,
+        819756386,
+        300326615,
+        590932579,
+        1405279636,
+        3267499572,
+        3150704214,
+        2428286686,
+        3959192993,
+        3461946742,
+        1862657033,
+        1266418056,
+        963775037,
+        2089974820,
+        2263052895,
+        1917689273,
+        448879540,
+        3550394620,
+        3981727096,
+        150775221,
+        3627908307,
+        1303187396,
+        508620638,
+        2975983352,
+        2726630617,
+        1817252668,
+        1876281319,
+        1457606340,
+        908771278,
+        3720792119,
+        3617206836,
+        2455994898,
+        1729034894,
+        1080033504,
+        976866871,
+        3556439503,
+        2881648439,
+        1522871579,
+        1555064734,
+        1336096578,
+        3548522304,
+        2579274686,
+        3574697629,
+        3205460757,
+        3593280638,
+        3338716283,
+        3079412587,
+        564236357,
+        2993598910,
+        1781952180,
+        1464380207,
+        3163844217,
+        3332601554,
+        1699332808,
+        1393555694,
+        1183702653,
+        3581086237,
+        1288719814,
+        691649499,
+        2847557200,
+        2895455976,
+        3193889540,
+        2717570544,
+        1781354906,
+        1676643554,
+        2592534050,
+        3230253752,
+        1126444790,
+        2770207658,
+        2633158820,
+        2210423226,
+        2615765581,
+        2414155088,
+        3127139286,
+        673620729,
+        2805611233,
+        1269405062,
+        4015350505,
+        3341807571,
+        4149409754,
+        1057255273,
+        2012875353,
+        2162469141,
+        2276492801,
+        2601117357,
+        993977747,
+        3918593370,
+        2654263191,
+        753973209,
+        36408145,
+        2530585658,
+        25011837,
+        3520020182,
+        2088578344,
+        530523599,
+        2918365339,
+        1524020338,
+        1518925132,
+        3760827505,
+        3759777254,
+        1202760957,
+        3985898139,
+        3906192525,
+        674977740,
+        4174734889,
+        2031300136,
+        2019492241,
+        3983892565,
+        4153806404,
+        3822280332,
+        352677332,
+        2297720250,
+        60907813,
+        90501309,
+        3286998549,
+        1016092578,
+        2535922412,
+        2839152426,
+        457141659,
+        509813237,
+        4120667899,
+        652014361,
+        1966332200,
+        2975202805,
+        55981186,
+        2327461051,
+        676427537,
+        3255491064,
+        2882294119,
+        3433927263,
+        1307055953,
+        942726286,
+        933058658,
+        2468411793,
+        3933900994,
+        4215176142,
+        1361170020,
+        2001714738,
+        2830558078,
+        3274259782,
+        1222529897,
+        1679025792,
+        2729314320,
+        3714953764,
+        1770335741,
+        151462246,
+        3013232138,
+        1682292957,
+        1483529935,
+        471910574,
+        1539241949,
+        458788160,
+        3436315007,
+        1807016891,
+        3718408830,
+        978976581,
+        1043663428,
+        3165965781,
+        1927990952,
+        4200891579,
+        2372276910,
+        3208408903,
+        3533431907,
+        1412390302,
+        2931980059,
+        4132332400,
+        1947078029,
+        3881505623,
+        4168226417,
+        2941484381,
+        1077988104,
+        1320477388,
+        886195818,
+        18198404,
+        3786409e3,
+        2509781533,
+        112762804,
+        3463356488,
+        1866414978,
+        891333506,
+        18488651,
+        661792760,
+        1628790961,
+        3885187036,
+        3141171499,
+        876946877,
+        2693282273,
+        1372485963,
+        791857591,
+        2686433993,
+        3759982718,
+        3167212022,
+        3472953795,
+        2716379847,
+        445679433,
+        3561995674,
+        3504004811,
+        3574258232,
+        54117162,
+        3331405415,
+        2381918588,
+        3769707343,
+        4154350007,
+        1140177722,
+        4074052095,
+        668550556,
+        3214352940,
+        367459370,
+        261225585,
+        2610173221,
+        4209349473,
+        3468074219,
+        3265815641,
+        314222801,
+        3066103646,
+        3808782860,
+        282218597,
+        3406013506,
+        3773591054,
+        379116347,
+        1285071038,
+        846784868,
+        2669647154,
+        3771962079,
+        3550491691,
+        2305946142,
+        453669953,
+        1268987020,
+        3317592352,
+        3279303384,
+        3744833421,
+        2610507566,
+        3859509063,
+        266596637,
+        3847019092,
+        517658769,
+        3462560207,
+        3443424879,
+        370717030,
+        4247526661,
+        2224018117,
+        4143653529,
+        4112773975,
+        2788324899,
+        2477274417,
+        1456262402,
+        2901442914,
+        1517677493,
+        1846949527,
+        2295493580,
+        3734397586,
+        2176403920,
+        1280348187,
+        1908823572,
+        3871786941,
+        846861322,
+        1172426758,
+        3287448474,
+        3383383037,
+        1655181056,
+        3139813346,
+        901632758,
+        1897031941,
+        2986607138,
+        3066810236,
+        3447102507,
+        1393639104,
+        373351379,
+        950779232,
+        625454576,
+        3124240540,
+        4148612726,
+        2007998917,
+        544563296,
+        2244738638,
+        2330496472,
+        2058025392,
+        1291430526,
+        424198748,
+        50039436,
+        29584100,
+        3605783033,
+        2429876329,
+        2791104160,
+        1057563949,
+        3255363231,
+        3075367218,
+        3463963227,
+        1469046755,
+        985887462
+      ];
+      var C_ORIG = [
+        1332899944,
+        1700884034,
+        1701343084,
+        1684370003,
+        1668446532,
+        1869963892
+      ];
+      function _encipher(lr, off, P, S) {
+        var n, l = lr[off], r = lr[off + 1];
+        l ^= P[0];
+        n = S[l >>> 24];
+        n += S[256 | l >> 16 & 255];
+        n ^= S[512 | l >> 8 & 255];
+        n += S[768 | l & 255];
+        r ^= n ^ P[1];
+        n = S[r >>> 24];
+        n += S[256 | r >> 16 & 255];
+        n ^= S[512 | r >> 8 & 255];
+        n += S[768 | r & 255];
+        l ^= n ^ P[2];
+        n = S[l >>> 24];
+        n += S[256 | l >> 16 & 255];
+        n ^= S[512 | l >> 8 & 255];
+        n += S[768 | l & 255];
+        r ^= n ^ P[3];
+        n = S[r >>> 24];
+        n += S[256 | r >> 16 & 255];
+        n ^= S[512 | r >> 8 & 255];
+        n += S[768 | r & 255];
+        l ^= n ^ P[4];
+        n = S[l >>> 24];
+        n += S[256 | l >> 16 & 255];
+        n ^= S[512 | l >> 8 & 255];
+        n += S[768 | l & 255];
+        r ^= n ^ P[5];
+        n = S[r >>> 24];
+        n += S[256 | r >> 16 & 255];
+        n ^= S[512 | r >> 8 & 255];
+        n += S[768 | r & 255];
+        l ^= n ^ P[6];
+        n = S[l >>> 24];
+        n += S[256 | l >> 16 & 255];
+        n ^= S[512 | l >> 8 & 255];
+        n += S[768 | l & 255];
+        r ^= n ^ P[7];
+        n = S[r >>> 24];
+        n += S[256 | r >> 16 & 255];
+        n ^= S[512 | r >> 8 & 255];
+        n += S[768 | r & 255];
+        l ^= n ^ P[8];
+        n = S[l >>> 24];
+        n += S[256 | l >> 16 & 255];
+        n ^= S[512 | l >> 8 & 255];
+        n += S[768 | l & 255];
+        r ^= n ^ P[9];
+        n = S[r >>> 24];
+        n += S[256 | r >> 16 & 255];
+        n ^= S[512 | r >> 8 & 255];
+        n += S[768 | r & 255];
+        l ^= n ^ P[10];
+        n = S[l >>> 24];
+        n += S[256 | l >> 16 & 255];
+        n ^= S[512 | l >> 8 & 255];
+        n += S[768 | l & 255];
+        r ^= n ^ P[11];
+        n = S[r >>> 24];
+        n += S[256 | r >> 16 & 255];
+        n ^= S[512 | r >> 8 & 255];
+        n += S[768 | r & 255];
+        l ^= n ^ P[12];
+        n = S[l >>> 24];
+        n += S[256 | l >> 16 & 255];
+        n ^= S[512 | l >> 8 & 255];
+        n += S[768 | l & 255];
+        r ^= n ^ P[13];
+        n = S[r >>> 24];
+        n += S[256 | r >> 16 & 255];
+        n ^= S[512 | r >> 8 & 255];
+        n += S[768 | r & 255];
+        l ^= n ^ P[14];
+        n = S[l >>> 24];
+        n += S[256 | l >> 16 & 255];
+        n ^= S[512 | l >> 8 & 255];
+        n += S[768 | l & 255];
+        r ^= n ^ P[15];
+        n = S[r >>> 24];
+        n += S[256 | r >> 16 & 255];
+        n ^= S[512 | r >> 8 & 255];
+        n += S[768 | r & 255];
+        l ^= n ^ P[16];
+        lr[off] = r ^ P[BLOWFISH_NUM_ROUNDS + 1];
+        lr[off + 1] = l;
+        return lr;
+      }
+      function _streamtoword(data, offp) {
+        for (var i = 0, word = 0; i < 4; ++i)
+          word = word << 8 | data[offp] & 255, offp = (offp + 1) % data.length;
+        return { key: word, offp };
+      }
+      function _key(key, P, S) {
+        var offset = 0, lr = [0, 0], plen = P.length, slen = S.length, sw;
+        for (var i = 0; i < plen; i++)
+          sw = _streamtoword(key, offset), offset = sw.offp, P[i] = P[i] ^ sw.key;
+        for (i = 0; i < plen; i += 2)
+          lr = _encipher(lr, 0, P, S), P[i] = lr[0], P[i + 1] = lr[1];
+        for (i = 0; i < slen; i += 2)
+          lr = _encipher(lr, 0, P, S), S[i] = lr[0], S[i + 1] = lr[1];
+      }
+      function _ekskey(data, key, P, S) {
+        var offp = 0, lr = [0, 0], plen = P.length, slen = S.length, sw;
+        for (var i = 0; i < plen; i++)
+          sw = _streamtoword(key, offp), offp = sw.offp, P[i] = P[i] ^ sw.key;
+        offp = 0;
+        for (i = 0; i < plen; i += 2)
+          sw = _streamtoword(data, offp), offp = sw.offp, lr[0] ^= sw.key, sw = _streamtoword(data, offp), offp = sw.offp, lr[1] ^= sw.key, lr = _encipher(lr, 0, P, S), P[i] = lr[0], P[i + 1] = lr[1];
+        for (i = 0; i < slen; i += 2)
+          sw = _streamtoword(data, offp), offp = sw.offp, lr[0] ^= sw.key, sw = _streamtoword(data, offp), offp = sw.offp, lr[1] ^= sw.key, lr = _encipher(lr, 0, P, S), S[i] = lr[0], S[i + 1] = lr[1];
+      }
+      function _crypt(b, salt, rounds, callback, progressCallback) {
+        var cdata = C_ORIG.slice(), clen = cdata.length, err;
+        if (rounds < 4 || rounds > 31) {
+          err = Error("Illegal number of rounds (4-31): " + rounds);
+          if (callback) {
+            nextTick(callback.bind(this, err));
+            return;
+          } else
+            throw err;
+        }
+        if (salt.length !== BCRYPT_SALT_LEN) {
+          err = Error("Illegal salt length: " + salt.length + " != " + BCRYPT_SALT_LEN);
+          if (callback) {
+            nextTick(callback.bind(this, err));
+            return;
+          } else
+            throw err;
+        }
+        rounds = 1 << rounds >>> 0;
+        var P, S, i = 0, j;
+        if (Int32Array) {
+          P = new Int32Array(P_ORIG);
+          S = new Int32Array(S_ORIG);
+        } else {
+          P = P_ORIG.slice();
+          S = S_ORIG.slice();
+        }
+        _ekskey(salt, b, P, S);
+        function next() {
+          if (progressCallback)
+            progressCallback(i / rounds);
+          if (i < rounds) {
+            var start = Date.now();
+            for (; i < rounds; ) {
+              i = i + 1;
+              _key(b, P, S);
+              _key(salt, P, S);
+              if (Date.now() - start > MAX_EXECUTION_TIME)
+                break;
+            }
+          } else {
+            for (i = 0; i < 64; i++)
+              for (j = 0; j < clen >> 1; j++)
+                _encipher(cdata, j << 1, P, S);
+            var ret = [];
+            for (i = 0; i < clen; i++)
+              ret.push((cdata[i] >> 24 & 255) >>> 0), ret.push((cdata[i] >> 16 & 255) >>> 0), ret.push((cdata[i] >> 8 & 255) >>> 0), ret.push((cdata[i] & 255) >>> 0);
+            if (callback) {
+              callback(null, ret);
+              return;
+            } else
+              return ret;
+          }
+          if (callback)
+            nextTick(next);
+        }
+        if (typeof callback !== "undefined") {
+          next();
+        } else {
+          var res;
+          while (true)
+            if (typeof (res = next()) !== "undefined")
+              return res || [];
+        }
+      }
+      function _hash(s, salt, callback, progressCallback) {
+        var err;
+        if (typeof s !== "string" || typeof salt !== "string") {
+          err = Error("Invalid string / salt: Not a string");
+          if (callback) {
+            nextTick(callback.bind(this, err));
+            return;
+          } else
+            throw err;
+        }
+        var minor, offset;
+        if (salt.charAt(0) !== "$" || salt.charAt(1) !== "2") {
+          err = Error("Invalid salt version: " + salt.substring(0, 2));
+          if (callback) {
+            nextTick(callback.bind(this, err));
+            return;
+          } else
+            throw err;
+        }
+        if (salt.charAt(2) === "$")
+          minor = String.fromCharCode(0), offset = 3;
+        else {
+          minor = salt.charAt(2);
+          if (minor !== "a" && minor !== "b" && minor !== "y" || salt.charAt(3) !== "$") {
+            err = Error("Invalid salt revision: " + salt.substring(2, 4));
+            if (callback) {
+              nextTick(callback.bind(this, err));
+              return;
+            } else
+              throw err;
+          }
+          offset = 4;
+        }
+        if (salt.charAt(offset + 2) > "$") {
+          err = Error("Missing salt rounds");
+          if (callback) {
+            nextTick(callback.bind(this, err));
+            return;
+          } else
+            throw err;
+        }
+        var r1 = parseInt(salt.substring(offset, offset + 1), 10) * 10, r2 = parseInt(salt.substring(offset + 1, offset + 2), 10), rounds = r1 + r2, real_salt = salt.substring(offset + 3, offset + 25);
+        s += minor >= "a" ? "\0" : "";
+        var passwordb = stringToBytes(s), saltb = base64_decode(real_salt, BCRYPT_SALT_LEN);
+        function finish(bytes) {
+          var res = [];
+          res.push("$2");
+          if (minor >= "a")
+            res.push(minor);
+          res.push("$");
+          if (rounds < 10)
+            res.push("0");
+          res.push(rounds.toString());
+          res.push("$");
+          res.push(base64_encode(saltb, saltb.length));
+          res.push(base64_encode(bytes, C_ORIG.length * 4 - 1));
+          return res.join("");
+        }
+        if (typeof callback == "undefined")
+          return finish(_crypt(passwordb, saltb, rounds));
+        else {
+          _crypt(passwordb, saltb, rounds, function(err2, bytes) {
+            if (err2)
+              callback(err2, null);
+            else
+              callback(null, finish(bytes));
+          }, progressCallback);
+        }
+      }
+      bcrypt.encodeBase64 = base64_encode;
+      bcrypt.decodeBase64 = base64_decode;
+      return bcrypt;
+    });
+  }
+});
+
+// node_modules/bcryptjs/index.js
+var require_bcryptjs = __commonJS({
+  "node_modules/bcryptjs/index.js"(exports, module) {
+    module.exports = require_bcrypt();
   }
 });
 
@@ -2932,6 +5163,73 @@ var MigrationRunner = class {
           `);
           db.run("CREATE INDEX IF NOT EXISTS idx_conversation_messages_session ON conversation_messages(content_session_id, message_index ASC)");
           db.run("CREATE INDEX IF NOT EXISTS idx_conversation_messages_project_epoch ON conversation_messages(project, created_at_epoch DESC)");
+        }
+      },
+      {
+        version: 15,
+        up: (db) => {
+          db.run(`
+            CREATE TABLE IF NOT EXISTS shared_tokens (
+              id TEXT PRIMARY KEY,
+              token TEXT NOT NULL UNIQUE,
+              project TEXT,
+              label TEXT,
+              created_at TEXT NOT NULL,
+              expires_at TEXT NOT NULL,
+              revoked_at TEXT
+            )
+          `);
+          db.run("CREATE INDEX IF NOT EXISTS idx_shared_tokens_token ON shared_tokens(token)");
+          db.run("CREATE INDEX IF NOT EXISTS idx_shared_tokens_project ON shared_tokens(project)");
+        }
+      },
+      {
+        version: 16,
+        up: (db) => {
+          db.run(`
+            CREATE TABLE IF NOT EXISTS users (
+              id TEXT PRIMARY KEY,
+              email TEXT NOT NULL UNIQUE,
+              password_hash TEXT NOT NULL,
+              role TEXT NOT NULL DEFAULT 'viewer',
+              display_name TEXT NOT NULL,
+              avatar_url TEXT,
+              is_active INTEGER NOT NULL DEFAULT 1,
+              created_at TEXT NOT NULL,
+              last_login TEXT
+            )
+          `);
+          db.run("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email)");
+          db.run("CREATE INDEX IF NOT EXISTS idx_users_role ON users(role)");
+          db.run(`
+            CREATE TABLE IF NOT EXISTS sessions_auth (
+              id TEXT PRIMARY KEY,
+              user_id TEXT NOT NULL,
+              token TEXT NOT NULL,
+              refresh_token TEXT NOT NULL UNIQUE,
+              expires_at TEXT NOT NULL,
+              refresh_expires_at TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            )
+          `);
+          db.run("CREATE INDEX IF NOT EXISTS idx_sessions_auth_user ON sessions_auth(user_id)");
+          db.run("CREATE INDEX IF NOT EXISTS idx_sessions_auth_token ON sessions_auth(token)");
+          db.run("CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_auth_refresh ON sessions_auth(refresh_token)");
+          db.run(`
+            CREATE TABLE IF NOT EXISTS audit_log (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              user_id TEXT NOT NULL,
+              action TEXT NOT NULL,
+              target TEXT,
+              details TEXT,
+              ip_address TEXT,
+              timestamp TEXT NOT NULL
+            )
+          `);
+          db.run("CREATE INDEX IF NOT EXISTS idx_audit_log_user ON audit_log(user_id)");
+          db.run("CREATE INDEX IF NOT EXISTS idx_audit_log_timestamp ON audit_log(timestamp DESC)");
+          db.run("CREATE INDEX IF NOT EXISTS idx_audit_log_action ON audit_log(action)");
         }
       }
     ];
@@ -3824,8 +6122,8 @@ var TotalRecallSDK = class {
   }
   detectProject() {
     try {
-      const { execSync: execSync3 } = __require("child_process");
-      const gitRoot = execSync3("git rev-parse --show-toplevel", {
+      const { execSync: execSync4 } = __require("child_process");
+      const gitRoot = execSync4("git rev-parse --show-toplevel", {
         cwd: process.cwd(),
         encoding: "utf8",
         stdio: ["pipe", "pipe", "ignore"]
@@ -4153,8 +6451,8 @@ var TotalRecallSDK = class {
    * Importa un transcript salvando solo i turni user/assistant/system testuali.
    */
   async importConversationTranscript(contentSessionId, transcriptPath) {
-    const { readFileSync: readFileSync6 } = await import("fs");
-    const raw = readFileSync6(transcriptPath, "utf8");
+    const { readFileSync: readFileSync7 } = await import("fs");
+    const raw = readFileSync7(transcriptPath, "utf8");
     const lines = raw.split("\n").filter(Boolean);
     let messageIndex = getConversationMessageCountBySession(this.db.db, contentSessionId);
     let inserted = 0;
@@ -4750,23 +7048,439 @@ function printBanner(opts) {
 // src/cli/contextkit.ts
 init_cli_utils();
 init_Observations();
+
+// src/services/team/TeamSync.ts
+import { execSync } from "node:child_process";
+import { existsSync as existsSync6, mkdirSync as mkdirSync5, readFileSync as readFileSync4, writeFileSync as writeFileSync3, readdirSync as readdirSync2 } from "node:fs";
+import { join as join5 } from "node:path";
+import { homedir as homedir2 } from "node:os";
+
+// src/services/team/TeamFormatter.ts
+import { createHash as createHash3 } from "node:crypto";
+function generateKnowledgeHash(project, title, type) {
+  const input = `${project}::${type}::${title}`;
+  return createHash3("sha256").update(input).digest("hex").substring(0, 12);
+}
+function knowledgeToMarkdown(item) {
+  const hash = generateKnowledgeHash(item.project, item.title, item.type);
+  const frontmatter = [
+    "---",
+    `id: ${hash}`,
+    `type: ${item.type}`,
+    `project: ${item.project}`,
+    `title: ${yamlEscapeString(item.title)}`,
+    `created: ${item.created_at}`,
+    `importance: ${item.importance}`,
+    `concepts: [${item.concepts.map((c) => yamlEscapeString(c)).join(", ")}]`
+  ];
+  if (item.severity) {
+    frontmatter.push(`severity: ${item.severity}`);
+  }
+  if (item.confidence) {
+    frontmatter.push(`confidence: ${item.confidence}`);
+  }
+  if (item.context) {
+    frontmatter.push(`context: ${yamlEscapeString(item.context)}`);
+  }
+  frontmatter.push("---");
+  const sections = [frontmatter.join("\n"), "", item.content];
+  if (item.reason) {
+    sections.push("", "## Reason", "", item.reason);
+  }
+  if (item.alternatives && item.alternatives.length > 0) {
+    sections.push("", "## Alternatives", "");
+    for (const alt of item.alternatives) {
+      sections.push(`- ${alt}`);
+    }
+  }
+  return sections.join("\n") + "\n";
+}
+function markdownToKnowledge(content, filename) {
+  const frontmatterMatch = content.match(/^---\n([\s\S]*?)\n---\n([\s\S]*)$/);
+  if (!frontmatterMatch) return null;
+  const frontmatterRaw = frontmatterMatch[1] ?? "";
+  const body = frontmatterMatch[2] ?? "";
+  const fm = parseFrontmatter(frontmatterRaw);
+  const type = fm["type"];
+  const project = fm["project"];
+  const title = fm["title"];
+  const created = fm["created"];
+  if (!type || !project || !title) return null;
+  const hash = fm["id"] || generateKnowledgeHash(project, title, type);
+  const importance = parseInt(fm["importance"] ?? "3", 10);
+  const concepts = parseYamlArray(fm["concepts"] ?? "");
+  const { mainContent, reason, alternatives } = parseBodySections(body);
+  const result = {
+    hash,
+    type,
+    project,
+    title,
+    content: mainContent,
+    created: created || (/* @__PURE__ */ new Date()).toISOString(),
+    importance,
+    concepts
+  };
+  if (reason) result.reason = reason;
+  if (alternatives.length > 0) result.alternatives = alternatives;
+  if (fm["severity"]) result.severity = fm["severity"];
+  if (fm["confidence"]) result.confidence = fm["confidence"];
+  if (fm["context"]) result.context = fm["context"];
+  return result;
+}
+function generateFilename(project, title, type) {
+  const hash = generateKnowledgeHash(project, title, type);
+  const safeTitle = title.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").substring(0, 50);
+  return `${hash}-${safeTitle}.md`;
+}
+function yamlEscapeString(value) {
+  if (/[:#\[\]{},&*!|>'"@`]/.test(value) || value.includes("\n")) {
+    return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+  }
+  return value;
+}
+function parseFrontmatter(raw) {
+  const result = {};
+  for (const line of raw.split("\n")) {
+    const colonIdx = line.indexOf(":");
+    if (colonIdx < 0) continue;
+    const key = line.substring(0, colonIdx).trim();
+    let value = line.substring(colonIdx + 1).trim();
+    if (value.startsWith('"') && value.endsWith('"') || value.startsWith("'") && value.endsWith("'")) {
+      value = value.slice(1, -1);
+    }
+    result[key] = value;
+  }
+  return result;
+}
+function parseYamlArray(value) {
+  const trimmed = value.trim();
+  if (!trimmed || trimmed === "[]") return [];
+  const inner = trimmed.startsWith("[") ? trimmed.slice(1, -1) : trimmed;
+  return inner.split(",").map((s) => {
+    let item = s.trim();
+    if (item.startsWith('"') && item.endsWith('"') || item.startsWith("'") && item.endsWith("'")) {
+      item = item.slice(1, -1);
+    }
+    return item;
+  }).filter(Boolean);
+}
+function parseBodySections(body) {
+  const lines = body.split("\n");
+  let mainContent = "";
+  let reason;
+  const alternatives = [];
+  let currentSection = "main";
+  for (const line of lines) {
+    if (line.trim() === "## Reason") {
+      currentSection = "reason";
+      continue;
+    }
+    if (line.trim() === "## Alternatives") {
+      currentSection = "alternatives";
+      continue;
+    }
+    switch (currentSection) {
+      case "main":
+        mainContent += line + "\n";
+        break;
+      case "reason":
+        if (reason === void 0) reason = "";
+        reason += line + "\n";
+        break;
+      case "alternatives":
+        if (line.trim().startsWith("- ")) {
+          alternatives.push(line.trim().substring(2));
+        }
+        break;
+    }
+  }
+  return {
+    mainContent: mainContent.trim(),
+    reason: reason?.trim() || void 0,
+    alternatives
+  };
+}
+
+// src/services/team/TeamSync.ts
+var TEAM_CONFIG_DIR = join5(homedir2(), ".totalrecall");
+var TEAM_CONFIG_PATH = join5(TEAM_CONFIG_DIR, "team.json");
+var DEFAULT_LOCAL_PATH = join5(TEAM_CONFIG_DIR, "team-repo");
+var KNOWLEDGE_DIR_NAME = "knowledge";
+var KNOWLEDGE_TYPES2 = ["constraint", "decision", "heuristic", "rejected"];
+function loadTeamConfig() {
+  if (!existsSync6(TEAM_CONFIG_PATH)) return null;
+  try {
+    const raw = readFileSync4(TEAM_CONFIG_PATH, "utf8");
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+function saveTeamConfig(config) {
+  if (!existsSync6(TEAM_CONFIG_DIR)) {
+    mkdirSync5(TEAM_CONFIG_DIR, { recursive: true });
+  }
+  writeFileSync3(TEAM_CONFIG_PATH, JSON.stringify(config, null, 2) + "\n", "utf8");
+}
+function initTeamConfig(repoUrl, options) {
+  const localPath = options?.localPath ?? DEFAULT_LOCAL_PATH;
+  const syncInterval = options?.syncInterval ?? 60;
+  if (!existsSync6(localPath)) {
+    mkdirSync5(localPath, { recursive: true });
+    try {
+      execSync(`git clone "${repoUrl}" "${localPath}"`, { stdio: "pipe", encoding: "utf8" });
+    } catch {
+      execSync("git init", { cwd: localPath, stdio: "pipe" });
+      execSync(`git remote add origin "${repoUrl}"`, { cwd: localPath, stdio: "pipe" });
+    }
+  }
+  const knowledgeDir = join5(localPath, KNOWLEDGE_DIR_NAME);
+  if (!existsSync6(knowledgeDir)) {
+    mkdirSync5(knowledgeDir, { recursive: true });
+  }
+  const config = {
+    repoUrl,
+    localPath,
+    syncInterval,
+    lastSync: null,
+    minImportance: 3
+  };
+  saveTeamConfig(config);
+  return config;
+}
+function exportKnowledge(db, targetDir, minImportance = 3) {
+  const knowledgeDir = join5(targetDir, KNOWLEDGE_DIR_NAME);
+  if (!existsSync6(knowledgeDir)) {
+    mkdirSync5(knowledgeDir, { recursive: true });
+  }
+  const placeholders = KNOWLEDGE_TYPES2.map(() => "?").join(",");
+  const rows = db.query(
+    `SELECT * FROM observations WHERE type IN (${placeholders}) ORDER BY created_at_epoch DESC`
+  ).all(...KNOWLEDGE_TYPES2);
+  let exported = 0;
+  for (const row of rows) {
+    const item = observationToExportItem(row);
+    if (item.importance < minImportance) continue;
+    const filename = generateFilename(item.project, item.title, item.type);
+    const filepath = join5(knowledgeDir, filename);
+    const markdown = knowledgeToMarkdown(item);
+    writeFileSync3(filepath, markdown, "utf8");
+    exported++;
+  }
+  return exported;
+}
+function observationToExportItem(obs) {
+  let metadata = {};
+  if (obs.facts) {
+    try {
+      metadata = JSON.parse(obs.facts);
+    } catch {
+    }
+  }
+  const importance = typeof metadata.importance === "number" ? metadata.importance : 3;
+  const concepts = obs.concepts ? obs.concepts.split(",").map((c) => c.trim()).filter(Boolean) : [];
+  const item = {
+    id: obs.id,
+    type: obs.type,
+    project: obs.project,
+    title: obs.title,
+    content: obs.text || "",
+    created_at: obs.created_at,
+    importance,
+    concepts
+  };
+  if ("reason" in metadata && metadata.reason) {
+    item.reason = metadata.reason;
+  }
+  if ("alternatives" in metadata && Array.isArray(metadata.alternatives)) {
+    item.alternatives = metadata.alternatives;
+  }
+  if ("severity" in metadata && metadata.severity) {
+    item.severity = metadata.severity;
+  }
+  if ("confidence" in metadata && metadata.confidence) {
+    item.confidence = metadata.confidence;
+  }
+  if ("context" in metadata && metadata.context) {
+    item.context = metadata.context;
+  }
+  return item;
+}
+function importKnowledge(db, sourceDir) {
+  const knowledgeDir = join5(sourceDir, KNOWLEDGE_DIR_NAME);
+  if (!existsSync6(knowledgeDir)) {
+    return { exported: 0, imported: 0, conflicts: [], errors: [] };
+  }
+  const files = readdirSync2(knowledgeDir).filter((f) => f.endsWith(".md"));
+  const result = { exported: 0, imported: 0, conflicts: [], errors: [] };
+  for (const file of files) {
+    const filepath = join5(knowledgeDir, file);
+    try {
+      const content = readFileSync4(filepath, "utf8");
+      const item = markdownToKnowledge(content, file);
+      if (!item) {
+        result.errors.push(`${file}: invalid format`);
+        continue;
+      }
+      const existingHash = generateKnowledgeHash(item.project, item.title, item.type);
+      const existing = findKnowledgeByHash(db, item.project, item.title, item.type);
+      if (existing) {
+        result.conflicts.push(`${file}: "${item.title}" already exists locally (local wins)`);
+        continue;
+      }
+      insertKnowledgeFromImport(db, item);
+      result.imported++;
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      result.errors.push(`${file}: ${msg}`);
+    }
+  }
+  return result;
+}
+function findKnowledgeByHash(db, project, title, type) {
+  const row = db.query(
+    "SELECT id FROM observations WHERE project = ? AND title = ? AND type = ? LIMIT 1"
+  ).get(project, title, type);
+  return !!row;
+}
+function insertKnowledgeFromImport(db, item) {
+  const metadata = {
+    knowledgeType: item.type,
+    importance: item.importance
+  };
+  if (item.reason) metadata["reason"] = item.reason;
+  if (item.alternatives) metadata["alternatives"] = item.alternatives;
+  if (item.severity) metadata["severity"] = item.severity;
+  if (item.confidence) metadata["confidence"] = item.confidence;
+  if (item.context) metadata["context"] = item.context;
+  const now = /* @__PURE__ */ new Date();
+  const createdAt = item.created || now.toISOString();
+  const createdAtEpoch = new Date(createdAt).getTime() || now.getTime();
+  const conceptsStr = item.concepts.length > 0 ? item.concepts.join(", ") : null;
+  db.run(
+    `INSERT INTO observations
+     (memory_session_id, project, type, title, subtitle, text, narrative, facts, concepts, files_read, files_modified, prompt_number, created_at, created_at_epoch, content_hash, discovery_tokens, auto_category)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      `team-sync-${Date.now()}`,
+      item.project,
+      item.type,
+      item.title,
+      null,
+      item.content,
+      null,
+      JSON.stringify(metadata),
+      conceptsStr,
+      null,
+      null,
+      0,
+      createdAt,
+      createdAtEpoch,
+      null,
+      0,
+      "knowledge"
+    ]
+  );
+}
+function git(localPath, command2) {
+  return execSync(`git ${command2}`, {
+    cwd: localPath,
+    encoding: "utf8",
+    stdio: ["pipe", "pipe", "pipe"]
+  }).trim();
+}
+function hasLocalChanges(localPath) {
+  const status2 = git(localPath, "status --porcelain");
+  return status2.length > 0;
+}
+function pushKnowledge(db, config) {
+  const result = { exported: 0, imported: 0, conflicts: [], errors: [] };
+  try {
+    result.exported = exportKnowledge(db, config.localPath, config.minImportance);
+    if (result.exported === 0 && !hasLocalChanges(config.localPath)) {
+      return result;
+    }
+    git(config.localPath, "add -A");
+    if (hasLocalChanges(config.localPath)) {
+      const timestamp = (/* @__PURE__ */ new Date()).toISOString().replace("T", " ").substring(0, 19);
+      git(config.localPath, `commit -m "team-sync: export ${result.exported} items (${timestamp})"`);
+    }
+    try {
+      git(config.localPath, "push origin HEAD");
+    } catch (pushErr) {
+      const msg = pushErr instanceof Error ? pushErr.message : String(pushErr);
+      result.errors.push(`Push failed: ${msg}`);
+    }
+    config.lastSync = (/* @__PURE__ */ new Date()).toISOString();
+    saveTeamConfig(config);
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    result.errors.push(`Export failed: ${msg}`);
+  }
+  return result;
+}
+function pullKnowledge(db, config) {
+  const result = { exported: 0, imported: 0, conflicts: [], errors: [] };
+  try {
+    try {
+      git(config.localPath, "pull origin HEAD --rebase");
+    } catch (pullErr) {
+      const msg = pullErr instanceof Error ? pullErr.message : String(pullErr);
+      if (!msg.includes("Couldn't find remote ref") && !msg.includes("no tracking information")) {
+        result.errors.push(`Pull failed: ${msg}`);
+        return result;
+      }
+    }
+    const importResult = importKnowledge(db, config.localPath);
+    result.imported = importResult.imported;
+    result.conflicts = importResult.conflicts;
+    result.errors.push(...importResult.errors);
+    config.lastSync = (/* @__PURE__ */ new Date()).toISOString();
+    saveTeamConfig(config);
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    result.errors.push(`Pull failed: ${msg}`);
+  }
+  return result;
+}
+function getTeamStatus(config) {
+  const knowledgeDir = join5(config.localPath, KNOWLEDGE_DIR_NAME);
+  let localKnowledgeCount = 0;
+  if (existsSync6(knowledgeDir)) {
+    localKnowledgeCount = readdirSync2(knowledgeDir).filter((f) => f.endsWith(".md")).length;
+  }
+  return {
+    configured: true,
+    repoUrl: config.repoUrl,
+    localPath: config.localPath,
+    lastSync: config.lastSync,
+    syncInterval: config.syncInterval,
+    localKnowledgeCount
+  };
+}
+
+// src/cli/contextkit.ts
 init_paths();
-import { execSync as execSync2 } from "child_process";
-import { existsSync as existsSync7, mkdirSync as mkdirSync6, readFileSync as readFileSync5, writeFileSync as writeFileSync4, appendFileSync as appendFileSync2, unlinkSync as unlinkSync3 } from "fs";
-import { join as join6, dirname as dirname3 } from "path";
-import { homedir as homedir3, platform, release } from "os";
+import { execSync as execSync3 } from "child_process";
+import { existsSync as existsSync8, mkdirSync as mkdirSync7, readFileSync as readFileSync6, writeFileSync as writeFileSync5, appendFileSync as appendFileSync2, unlinkSync as unlinkSync3 } from "fs";
+import { join as join7, dirname as dirname3, basename as basename4 } from "path";
+import { homedir as homedir4, platform, release } from "os";
 import { fileURLToPath as fileURLToPath2 } from "url";
 import { createInterface } from "readline";
 import * as http from "http";
 var args = process.argv.slice(2);
 var command = args[0];
+var binName = basename4(process.argv[1] ?? "");
+if (binName === "kiro-memory") {
+  console.error('Note: "kiro-memory" is a legacy alias. The canonical command is "totalrecall".\n');
+}
 var __filename = fileURLToPath2(import.meta.url);
 var __dirname2 = dirname3(__filename);
 var DIST_DIR = dirname3(__dirname2);
 var PKG_VERSION = "unknown";
 try {
-  const pkgPath = join6(DIST_DIR, "..", "..", "package.json");
-  PKG_VERSION = JSON.parse(readFileSync5(pkgPath, "utf8")).version;
+  const pkgPath = join7(DIST_DIR, "..", "..", "package.json");
+  PKG_VERSION = JSON.parse(readFileSync6(pkgPath, "utf8")).version;
 } catch {
 }
 var AGENT_TEMPLATE = JSON.stringify({
@@ -4820,8 +7534,8 @@ function isWSL() {
   try {
     const rel = release().toLowerCase();
     if (rel.includes("microsoft") || rel.includes("wsl")) return true;
-    if (existsSync7("/proc/version")) {
-      const proc = readFileSync5("/proc/version", "utf8").toLowerCase();
+    if (existsSync8("/proc/version")) {
+      const proc = readFileSync6("/proc/version", "utf8").toLowerCase();
       return proc.includes("microsoft") || proc.includes("wsl");
     }
     return false;
@@ -4831,7 +7545,7 @@ function isWSL() {
 }
 function commandExists(cmd) {
   try {
-    execSync2(`which ${cmd}`, { stdio: "ignore" });
+    execSync3(`which ${cmd}`, { stdio: "ignore" });
     return true;
   } catch {
     return false;
@@ -4859,7 +7573,7 @@ function runEnvironmentChecks() {
       fix: nodeOnWindows ? "Install Node.js inside WSL:\n  curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -\n  sudo apt-get install -y nodejs\n  Or use nvm: https://github.com/nvm-sh/nvm" : void 0
     });
     try {
-      const npmPrefix = execSync2("npm prefix -g", { encoding: "utf8" }).trim();
+      const npmPrefix = execSync3("npm prefix -g", { encoding: "utf8" }).trim();
       const prefixOnWindows = isWindowsPath(npmPrefix);
       checks.push({
         name: "WSL: npm global prefix",
@@ -4880,7 +7594,7 @@ function runEnvironmentChecks() {
       });
     }
     try {
-      const npmPath = execSync2("which npm", { encoding: "utf8" }).trim();
+      const npmPath = execSync3("which npm", { encoding: "utf8" }).trim();
       const npmOnWindows = isWindowsPath(npmPath);
       checks.push({
         name: "WSL: npm binary",
@@ -4960,9 +7674,9 @@ function askUser(question) {
 }
 function detectShellRc() {
   const shell = process.env.SHELL || "/bin/bash";
-  if (shell.includes("zsh")) return { name: "zsh", rcFile: join6(homedir3(), ".zshrc") };
-  if (shell.includes("fish")) return { name: "fish", rcFile: join6(homedir3(), ".config/fish/config.fish") };
-  return { name: "bash", rcFile: join6(homedir3(), ".bashrc") };
+  if (shell.includes("zsh")) return { name: "zsh", rcFile: join7(homedir4(), ".zshrc") };
+  if (shell.includes("fish")) return { name: "fish", rcFile: join7(homedir4(), ".config/fish/config.fish") };
+  return { name: "bash", rcFile: join7(homedir4(), ".bashrc") };
 }
 var AUTOFIXABLE_CHECKS = /* @__PURE__ */ new Set([
   "WSL: npm global prefix",
@@ -4992,14 +7706,14 @@ async function tryAutoFix(failedChecks) {
   if (prefixCheck) {
     console.log("  Fixing npm global prefix...");
     try {
-      const npmGlobalDir = join6(homedir3(), ".npm-global");
-      mkdirSync6(npmGlobalDir, { recursive: true });
+      const npmGlobalDir = join7(homedir4(), ".npm-global");
+      mkdirSync7(npmGlobalDir, { recursive: true });
       const { spawnSync: spawnNpmConfig } = __require("child_process");
       spawnNpmConfig("npm", ["config", "set", "prefix", npmGlobalDir], { stdio: "ignore" });
       const exportLine = 'export PATH="$HOME/.npm-global/bin:$PATH"';
       let alreadyInRc = false;
-      if (existsSync7(rcFile)) {
-        const content = readFileSync5(rcFile, "utf8");
+      if (existsSync8(rcFile)) {
+        const content = readFileSync6(rcFile, "utf8");
         alreadyInRc = content.includes(".npm-global/bin");
       }
       if (!alreadyInRc) {
@@ -5019,20 +7733,20 @@ ${exportLine}
   const npmBinaryCheck = fixable.find((c) => c.name === "WSL: npm binary");
   if (npmBinaryCheck) {
     console.log("\n  Fixing npm binary (installing nvm + Node.js 22)...");
-    const nvmDir = join6(homedir3(), ".nvm");
+    const nvmDir = join7(homedir4(), ".nvm");
     try {
-      if (existsSync7(nvmDir)) {
+      if (existsSync8(nvmDir)) {
         console.log(`  nvm already installed at ${nvmDir}`);
       } else {
         console.log("  Downloading nvm...");
-        execSync2("curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash", {
+        execSync3("curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash", {
           stdio: "inherit",
           timeout: 6e4
         });
         console.log(`  \x1B[32m\u2713\x1B[0m nvm installed`);
       }
       console.log("  Installing Node.js 22 via nvm...");
-      execSync2('bash -c "source $HOME/.nvm/nvm.sh && nvm install 22"', {
+      execSync3('bash -c "source $HOME/.nvm/nvm.sh && nvm install 22"', {
         stdio: "inherit",
         timeout: 12e4
       });
@@ -5051,7 +7765,7 @@ ${exportLine}
   if (buildCheck) {
     console.log("\n  Fixing build tools (requires sudo)...");
     try {
-      execSync2("sudo apt-get update -qq && sudo apt-get install -y build-essential python3", {
+      execSync3("sudo apt-get update -qq && sudo apt-get install -y build-essential python3", {
         stdio: "inherit",
         timeout: 12e4
       });
@@ -5069,8 +7783,8 @@ ${exportLine}
       const { spawnSync: spawnRebuild } = __require("child_process");
       const globalDirResult = spawnRebuild("npm", ["prefix", "-g"], { encoding: "utf8", stdio: ["pipe", "pipe", "ignore"] });
       const globalDir = (globalDirResult.stdout || "").trim();
-      const sqlitePkg = join6(globalDir, "lib", "node_modules", "totalrecall");
-      if (existsSync7(sqlitePkg)) {
+      const sqlitePkg = join7(globalDir, "lib", "node_modules", "totalrecall");
+      if (existsSync8(sqlitePkg)) {
         spawnRebuild("npm", ["rebuild", "better-sqlite3"], {
           cwd: sqlitePkg,
           stdio: "inherit",
@@ -5119,43 +7833,43 @@ async function installKiro() {
   }
   const distDir = DIST_DIR;
   const kiroDir = KIRO_CONFIG_DIR;
-  const agentsDir = join6(kiroDir, "agents");
-  const settingsDir = join6(kiroDir, "settings");
-  const steeringDir = join6(kiroDir, "steering");
+  const agentsDir = join7(kiroDir, "agents");
+  const settingsDir = join7(kiroDir, "settings");
+  const steeringDir = join7(kiroDir, "steering");
   const dataDir = DATA_DIR;
   console.log("[2/4] Installing Kiro configuration...\n");
   for (const dir of [agentsDir, settingsDir, steeringDir, dataDir]) {
-    mkdirSync6(dir, { recursive: true });
+    mkdirSync7(dir, { recursive: true });
   }
   const agentConfig = AGENT_TEMPLATE.replace(/__DIST_DIR__/g, distDir);
-  const agentDestPath = join6(agentsDir, "totalrecall.json");
-  writeFileSync4(agentDestPath, agentConfig, "utf8");
+  const agentDestPath = join7(agentsDir, "totalrecall.json");
+  writeFileSync5(agentDestPath, agentConfig, "utf8");
   console.log(`  \u2192 Agent config: ${agentDestPath}`);
-  const mcpFilePath = join6(settingsDir, "mcp.json");
+  const mcpFilePath = join7(settingsDir, "mcp.json");
   let mcpConfig = { mcpServers: {} };
-  if (existsSync7(mcpFilePath)) {
+  if (existsSync8(mcpFilePath)) {
     try {
-      mcpConfig = JSON.parse(readFileSync5(mcpFilePath, "utf8"));
+      mcpConfig = JSON.parse(readFileSync6(mcpFilePath, "utf8"));
       if (!mcpConfig.mcpServers) mcpConfig.mcpServers = {};
     } catch {
     }
   }
   mcpConfig.mcpServers["totalrecall"] = {
     command: "node",
-    args: [join6(distDir, "servers", "mcp-server.js")]
+    args: [join7(distDir, "servers", "mcp-server.js")]
   };
-  writeFileSync4(mcpFilePath, JSON.stringify(mcpConfig, null, 2), "utf8");
+  writeFileSync5(mcpFilePath, JSON.stringify(mcpConfig, null, 2), "utf8");
   console.log(`  \u2192 MCP config:   ${mcpFilePath}`);
-  const steeringDestPath = join6(steeringDir, "totalrecall.md");
-  writeFileSync4(steeringDestPath, STEERING_CONTENT, "utf8");
+  const steeringDestPath = join7(steeringDir, "totalrecall.md");
+  writeFileSync5(steeringDestPath, STEERING_CONTENT, "utf8");
   console.log(`  \u2192 Steering:     ${steeringDestPath}`);
   console.log(`  \u2192 Data dir:     ${dataDir}`);
   console.log("\n[3/4] Shell alias setup\n");
   const { rcFile } = detectShellRc();
   const aliasLine = 'alias kiro="kiro-cli --agent totalrecall"';
   let aliasAlreadySet = false;
-  if (existsSync7(rcFile)) {
-    const rcContent = readFileSync5(rcFile, "utf8");
+  if (existsSync8(rcFile)) {
+    const rcContent = readFileSync6(rcFile, "utf8");
     aliasAlreadySet = rcContent.includes("alias kiro=") && rcContent.includes("totalrecall");
   }
   if (aliasAlreadySet) {
@@ -5262,16 +7976,16 @@ async function installClaudeCode() {
     }
   }
   const distDir = DIST_DIR;
-  const claudeDir = join6(homedir3(), ".claude");
+  const claudeDir = join7(homedir4(), ".claude");
   const dataDir = DATA_DIR;
   console.log("[2/3] Installing Claude Code configuration...\n");
-  mkdirSync6(claudeDir, { recursive: true });
-  mkdirSync6(dataDir, { recursive: true });
-  const settingsPath = join6(claudeDir, "settings.json");
+  mkdirSync7(claudeDir, { recursive: true });
+  mkdirSync7(dataDir, { recursive: true });
+  const settingsPath = join7(claudeDir, "settings.json");
   let settings = {};
-  if (existsSync7(settingsPath)) {
+  if (existsSync8(settingsPath)) {
     try {
-      settings = JSON.parse(readFileSync5(settingsPath, "utf8"));
+      settings = JSON.parse(readFileSync6(settingsPath, "utf8"));
     } catch {
     }
   }
@@ -5286,7 +8000,7 @@ async function installClaudeCode() {
       matcher: "",
       hooks: [{
         type: "command",
-        command: `node ${join6(distDir, config.script)}`,
+        command: `node ${join7(distDir, config.script)}`,
         timeout: config.timeout
       }]
     };
@@ -5301,31 +8015,31 @@ async function installClaudeCode() {
       settings[event].push(hookEntry);
     }
   }
-  writeFileSync4(settingsPath, JSON.stringify(settings, null, 2), "utf8");
+  writeFileSync5(settingsPath, JSON.stringify(settings, null, 2), "utf8");
   console.log(`  \u2192 Hooks config: ${settingsPath}`);
-  const mcpPath = join6(homedir3(), ".mcp.json");
+  const mcpPath = join7(homedir4(), ".mcp.json");
   let mcpConfig = {};
-  if (existsSync7(mcpPath)) {
+  if (existsSync8(mcpPath)) {
     try {
-      mcpConfig = JSON.parse(readFileSync5(mcpPath, "utf8"));
+      mcpConfig = JSON.parse(readFileSync6(mcpPath, "utf8"));
     } catch {
     }
   }
   if (!mcpConfig.mcpServers) mcpConfig.mcpServers = {};
   mcpConfig.mcpServers["totalrecall"] = {
     command: "node",
-    args: [join6(distDir, "servers", "mcp-server.js")]
+    args: [join7(distDir, "servers", "mcp-server.js")]
   };
-  writeFileSync4(mcpPath, JSON.stringify(mcpConfig, null, 2), "utf8");
+  writeFileSync5(mcpPath, JSON.stringify(mcpConfig, null, 2), "utf8");
   console.log(`  \u2192 MCP config:   ${mcpPath}`);
-  const steeringPath = join6(claudeDir, "CLAUDE.md");
+  const steeringPath = join7(claudeDir, "CLAUDE.md");
   let existingSteering = "";
-  if (existsSync7(steeringPath)) {
-    existingSteering = readFileSync5(steeringPath, "utf8");
+  if (existsSync8(steeringPath)) {
+    existingSteering = readFileSync6(steeringPath, "utf8");
   }
   if (!existingSteering.includes("Total Recall")) {
     const separator = existingSteering.length > 0 ? "\n\n---\n\n" : "";
-    writeFileSync4(steeringPath, existingSteering + separator + CLAUDE_CODE_STEERING, "utf8");
+    writeFileSync5(steeringPath, existingSteering + separator + CLAUDE_CODE_STEERING, "utf8");
     console.log(`  \u2192 Steering:     ${steeringPath}`);
   } else {
     console.log(`  \u2192 Steering:     ${steeringPath} (already configured)`);
@@ -5369,16 +8083,16 @@ async function installCursor() {
     }
   }
   const distDir = DIST_DIR;
-  const cursorDir = join6(homedir3(), ".cursor");
+  const cursorDir = join7(homedir4(), ".cursor");
   const dataDir = DATA_DIR;
   console.log("[2/3] Installing Cursor configuration...\n");
-  mkdirSync6(cursorDir, { recursive: true });
-  mkdirSync6(dataDir, { recursive: true });
-  const hooksPath = join6(cursorDir, "hooks.json");
+  mkdirSync7(cursorDir, { recursive: true });
+  mkdirSync7(dataDir, { recursive: true });
+  const hooksPath = join7(cursorDir, "hooks.json");
   let hooksConfig = { version: 1, hooks: {} };
-  if (existsSync7(hooksPath)) {
+  if (existsSync8(hooksPath)) {
     try {
-      hooksConfig = JSON.parse(readFileSync5(hooksPath, "utf8"));
+      hooksConfig = JSON.parse(readFileSync6(hooksPath, "utf8"));
       if (!hooksConfig.hooks) hooksConfig.hooks = {};
       if (!hooksConfig.version) hooksConfig.version = 1;
     } catch {
@@ -5394,7 +8108,7 @@ async function installCursor() {
   };
   for (const [event, script] of Object.entries(cursorHookMap)) {
     const hookEntry = {
-      command: `node ${join6(distDir, script)}`
+      command: `node ${join7(distDir, script)}`
     };
     if (!hooksConfig.hooks[event]) {
       hooksConfig.hooks[event] = [hookEntry];
@@ -5405,22 +8119,22 @@ async function installCursor() {
       hooksConfig.hooks[event].push(hookEntry);
     }
   }
-  writeFileSync4(hooksPath, JSON.stringify(hooksConfig, null, 2), "utf8");
+  writeFileSync5(hooksPath, JSON.stringify(hooksConfig, null, 2), "utf8");
   console.log(`  \u2192 Hooks config: ${hooksPath}`);
-  const mcpPath = join6(cursorDir, "mcp.json");
+  const mcpPath = join7(cursorDir, "mcp.json");
   let mcpConfig = {};
-  if (existsSync7(mcpPath)) {
+  if (existsSync8(mcpPath)) {
     try {
-      mcpConfig = JSON.parse(readFileSync5(mcpPath, "utf8"));
+      mcpConfig = JSON.parse(readFileSync6(mcpPath, "utf8"));
     } catch {
     }
   }
   if (!mcpConfig.mcpServers) mcpConfig.mcpServers = {};
   mcpConfig.mcpServers["totalrecall"] = {
     command: "node",
-    args: [join6(distDir, "servers", "mcp-server.js")]
+    args: [join7(distDir, "servers", "mcp-server.js")]
   };
-  writeFileSync4(mcpPath, JSON.stringify(mcpConfig, null, 2), "utf8");
+  writeFileSync5(mcpPath, JSON.stringify(mcpConfig, null, 2), "utf8");
   console.log(`  \u2192 MCP config:   ${mcpPath}`);
   console.log(`  \u2192 Data dir:     ${dataDir}`);
   console.log("\n[3/3] Done!\n");
@@ -5462,23 +8176,23 @@ async function installWindsurf() {
   const distDir = DIST_DIR;
   const dataDir = DATA_DIR;
   console.log("[2/3] Installing Windsurf configuration...\n");
-  mkdirSync6(dataDir, { recursive: true });
-  const windsurfDir = join6(homedir3(), ".codeium", "windsurf");
-  mkdirSync6(windsurfDir, { recursive: true });
-  const mcpPath = join6(windsurfDir, "mcp_config.json");
+  mkdirSync7(dataDir, { recursive: true });
+  const windsurfDir = join7(homedir4(), ".codeium", "windsurf");
+  mkdirSync7(windsurfDir, { recursive: true });
+  const mcpPath = join7(windsurfDir, "mcp_config.json");
   let mcpConfig = {};
-  if (existsSync7(mcpPath)) {
+  if (existsSync8(mcpPath)) {
     try {
-      mcpConfig = JSON.parse(readFileSync5(mcpPath, "utf8"));
+      mcpConfig = JSON.parse(readFileSync6(mcpPath, "utf8"));
     } catch {
     }
   }
   if (!mcpConfig.mcpServers) mcpConfig.mcpServers = {};
   mcpConfig.mcpServers["totalrecall"] = {
     command: "node",
-    args: [join6(distDir, "servers", "mcp-server.js")]
+    args: [join7(distDir, "servers", "mcp-server.js")]
   };
-  writeFileSync4(mcpPath, JSON.stringify(mcpConfig, null, 2), "utf8");
+  writeFileSync5(mcpPath, JSON.stringify(mcpConfig, null, 2), "utf8");
   console.log(`  \u2192 MCP config:   ${mcpPath}`);
   console.log(`  \u2192 Data dir:     ${dataDir}`);
   console.log("\n[3/3] Done!\n");
@@ -5521,29 +8235,29 @@ async function installCline() {
   const distDir = DIST_DIR;
   const dataDir = DATA_DIR;
   console.log("[2/3] Installing Cline configuration...\n");
-  mkdirSync6(dataDir, { recursive: true });
+  mkdirSync7(dataDir, { recursive: true });
   const platform2 = process.platform;
   let clineSettingsDir;
   if (platform2 === "darwin") {
-    clineSettingsDir = join6(homedir3(), "Library", "Application Support", "Code", "User", "globalStorage", "saoudrizwan.claude-dev", "settings");
+    clineSettingsDir = join7(homedir4(), "Library", "Application Support", "Code", "User", "globalStorage", "saoudrizwan.claude-dev", "settings");
   } else {
-    clineSettingsDir = join6(homedir3(), ".config", "Code", "User", "globalStorage", "saoudrizwan.claude-dev", "settings");
+    clineSettingsDir = join7(homedir4(), ".config", "Code", "User", "globalStorage", "saoudrizwan.claude-dev", "settings");
   }
-  mkdirSync6(clineSettingsDir, { recursive: true });
-  const mcpPath = join6(clineSettingsDir, "cline_mcp_settings.json");
+  mkdirSync7(clineSettingsDir, { recursive: true });
+  const mcpPath = join7(clineSettingsDir, "cline_mcp_settings.json");
   let mcpConfig = {};
-  if (existsSync7(mcpPath)) {
+  if (existsSync8(mcpPath)) {
     try {
-      mcpConfig = JSON.parse(readFileSync5(mcpPath, "utf8"));
+      mcpConfig = JSON.parse(readFileSync6(mcpPath, "utf8"));
     } catch {
     }
   }
   if (!mcpConfig.mcpServers) mcpConfig.mcpServers = {};
   mcpConfig.mcpServers["totalrecall"] = {
     command: "node",
-    args: [join6(distDir, "servers", "mcp-server.js")]
+    args: [join7(distDir, "servers", "mcp-server.js")]
   };
-  writeFileSync4(mcpPath, JSON.stringify(mcpConfig, null, 2), "utf8");
+  writeFileSync5(mcpPath, JSON.stringify(mcpConfig, null, 2), "utf8");
   console.log(`  \u2192 MCP config:   ${mcpPath}`);
   console.log(`  \u2192 Data dir:     ${dataDir}`);
   console.log("\n[3/3] Done!\n");
@@ -5563,19 +8277,19 @@ async function runDoctor() {
   console.log("\n=== Total Recall - Diagnostics ===");
   const checks = runEnvironmentChecks();
   const kiroDir = KIRO_CONFIG_DIR;
-  const agentPath = join6(kiroDir, "agents", "totalrecall.json");
-  const mcpPath = join6(kiroDir, "settings", "mcp.json");
+  const agentPath = join7(kiroDir, "agents", "totalrecall.json");
+  const mcpPath = join7(kiroDir, "settings", "mcp.json");
   const dataDir = DATA_DIR;
   checks.push({
     name: "Kiro agent config",
-    ok: existsSync7(agentPath),
-    message: existsSync7(agentPath) ? agentPath : "Not found",
-    fix: !existsSync7(agentPath) ? "Run: totalrecall install" : void 0
+    ok: existsSync8(agentPath),
+    message: existsSync8(agentPath) ? agentPath : "Not found",
+    fix: !existsSync8(agentPath) ? "Run: totalrecall install" : void 0
   });
   let mcpOk = false;
-  if (existsSync7(mcpPath)) {
+  if (existsSync8(mcpPath)) {
     try {
-      const mcp = JSON.parse(readFileSync5(mcpPath, "utf8"));
+      const mcp = JSON.parse(readFileSync6(mcpPath, "utf8"));
       mcpOk = !!mcp.mcpServers?.["totalrecall"] || !!mcp.mcpServers?.contextkit;
     } catch {
     }
@@ -5588,15 +8302,15 @@ async function runDoctor() {
   });
   checks.push({
     name: "Data directory",
-    ok: existsSync7(dataDir),
-    message: existsSync7(dataDir) ? dataDir : "Not created (will be created on first use)"
+    ok: existsSync8(dataDir),
+    message: existsSync8(dataDir) ? dataDir : "Not created (will be created on first use)"
   });
-  const claudeDir = join6(homedir3(), ".claude");
-  const claudeSettingsPath = join6(claudeDir, "settings.json");
+  const claudeDir = join7(homedir4(), ".claude");
+  const claudeSettingsPath = join7(claudeDir, "settings.json");
   let claudeHooksOk = false;
-  if (existsSync7(claudeSettingsPath)) {
+  if (existsSync8(claudeSettingsPath)) {
     try {
-      const claudeSettings = JSON.parse(readFileSync5(claudeSettingsPath, "utf8"));
+      const claudeSettings = JSON.parse(readFileSync6(claudeSettingsPath, "utf8"));
       claudeHooksOk = !!(claudeSettings?.SessionStart || claudeSettings?.PostToolUse);
       if (claudeHooksOk) {
         const allSettings = JSON.stringify(claudeSettings);
@@ -5605,11 +8319,11 @@ async function runDoctor() {
     } catch {
     }
   }
-  const claudeMcpPath = join6(homedir3(), ".mcp.json");
+  const claudeMcpPath = join7(homedir4(), ".mcp.json");
   let claudeMcpOk = false;
-  if (existsSync7(claudeMcpPath)) {
+  if (existsSync8(claudeMcpPath)) {
     try {
-      const claudeMcp = JSON.parse(readFileSync5(claudeMcpPath, "utf8"));
+      const claudeMcp = JSON.parse(readFileSync6(claudeMcpPath, "utf8"));
       claudeMcpOk = !!claudeMcp.mcpServers?.["totalrecall"];
     } catch {
     }
@@ -5626,12 +8340,12 @@ async function runDoctor() {
     // Non-blocking: optional installation
     message: claudeMcpOk ? "totalrecall registered in ~/.mcp.json" : "Not configured (optional: run totalrecall install --claude-code)"
   });
-  const cursorDir = join6(homedir3(), ".cursor");
-  const cursorHooksPath = join6(cursorDir, "hooks.json");
+  const cursorDir = join7(homedir4(), ".cursor");
+  const cursorHooksPath = join7(cursorDir, "hooks.json");
   let cursorHooksOk = false;
-  if (existsSync7(cursorHooksPath)) {
+  if (existsSync8(cursorHooksPath)) {
     try {
-      const cursorHooks = JSON.parse(readFileSync5(cursorHooksPath, "utf8"));
+      const cursorHooks = JSON.parse(readFileSync6(cursorHooksPath, "utf8"));
       cursorHooksOk = !!(cursorHooks.hooks?.sessionStart || cursorHooks.hooks?.afterFileEdit);
       if (cursorHooksOk) {
         const allHooks = JSON.stringify(cursorHooks.hooks);
@@ -5640,11 +8354,11 @@ async function runDoctor() {
     } catch {
     }
   }
-  const cursorMcpPath = join6(cursorDir, "mcp.json");
+  const cursorMcpPath = join7(cursorDir, "mcp.json");
   let cursorMcpOk = false;
-  if (existsSync7(cursorMcpPath)) {
+  if (existsSync8(cursorMcpPath)) {
     try {
-      const cursorMcp = JSON.parse(readFileSync5(cursorMcpPath, "utf8"));
+      const cursorMcp = JSON.parse(readFileSync6(cursorMcpPath, "utf8"));
       cursorMcpOk = !!cursorMcp.mcpServers?.["totalrecall"];
     } catch {
     }
@@ -5661,11 +8375,11 @@ async function runDoctor() {
     // Non-blocking: optional installation
     message: cursorMcpOk ? "totalrecall registered in ~/.cursor/mcp.json" : "Not configured (optional: run totalrecall install --cursor)"
   });
-  const windsurfMcpPath = join6(homedir3(), ".codeium", "windsurf", "mcp_config.json");
+  const windsurfMcpPath = join7(homedir4(), ".codeium", "windsurf", "mcp_config.json");
   let windsurfMcpOk = false;
-  if (existsSync7(windsurfMcpPath)) {
+  if (existsSync8(windsurfMcpPath)) {
     try {
-      const windsurfMcp = JSON.parse(readFileSync5(windsurfMcpPath, "utf8"));
+      const windsurfMcp = JSON.parse(readFileSync6(windsurfMcpPath, "utf8"));
       windsurfMcpOk = !!windsurfMcp.mcpServers?.["totalrecall"];
     } catch {
     }
@@ -5679,15 +8393,15 @@ async function runDoctor() {
   const clinePlatform = process.platform;
   let clineSettingsBase;
   if (clinePlatform === "darwin") {
-    clineSettingsBase = join6(homedir3(), "Library", "Application Support", "Code", "User", "globalStorage", "saoudrizwan.claude-dev", "settings");
+    clineSettingsBase = join7(homedir4(), "Library", "Application Support", "Code", "User", "globalStorage", "saoudrizwan.claude-dev", "settings");
   } else {
-    clineSettingsBase = join6(homedir3(), ".config", "Code", "User", "globalStorage", "saoudrizwan.claude-dev", "settings");
+    clineSettingsBase = join7(homedir4(), ".config", "Code", "User", "globalStorage", "saoudrizwan.claude-dev", "settings");
   }
-  const clineMcpPath = join6(clineSettingsBase, "cline_mcp_settings.json");
+  const clineMcpPath = join7(clineSettingsBase, "cline_mcp_settings.json");
   let clineMcpOk = false;
-  if (existsSync7(clineMcpPath)) {
+  if (existsSync8(clineMcpPath)) {
     try {
-      const clineMcp = JSON.parse(readFileSync5(clineMcpPath, "utf8"));
+      const clineMcp = JSON.parse(readFileSync6(clineMcpPath, "utf8"));
       clineMcpOk = !!clineMcp.mcpServers?.["totalrecall"];
     } catch {
     }
@@ -5701,7 +8415,7 @@ async function runDoctor() {
   let workerOk = false;
   try {
     const port = process.env.TOTALRECALL_WORKER_PORT || "3001";
-    execSync2(`curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:${port}/health`, {
+    execSync3(`curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:${port}/health`, {
       timeout: 2e3,
       encoding: "utf8"
     });
@@ -5770,6 +8484,10 @@ async function main() {
     await handleBackup(args.slice(1));
     return;
   }
+  if (command === "share") {
+    await handleShare(args.slice(1));
+    return;
+  }
   if (command === "worker:start" || command === "worker:stop" || command === "worker:restart" || command === "worker:status") {
     await handleWorker(command);
     return;
@@ -5780,6 +8498,14 @@ async function main() {
   }
   if (command === "plugins") {
     await handlePlugins(args.slice(1));
+    return;
+  }
+  if (command === "users") {
+    await handleUsers(args.slice(1));
+    return;
+  }
+  if (command === "team") {
+    await handleTeam(args.slice(1));
     return;
   }
   const sdk = createTotalRecall();
@@ -6189,7 +8915,7 @@ async function generateReportCli(sdk, cliArgs) {
       output = formatReportText(data);
   }
   if (outputArg) {
-    writeFileSync4(outputArg, output, "utf8");
+    writeFileSync5(outputArg, output, "utf8");
     console.log(`
   Report saved to: ${outputArg}
 `);
@@ -6341,7 +9067,7 @@ async function exportObservations(sdk, cliArgs) {
     }
     const output = generateExportOutput(observations, format);
     if (outputArg) {
-      writeFileSync4(outputArg, output, "utf8");
+      writeFileSync5(outputArg, output, "utf8");
       console.error(`
   Esportate ${observations.length} observations in: ${outputArg}
 `);
@@ -6397,51 +9123,264 @@ async function exportObservations(sdk, cliArgs) {
 async function importObservations(cliArgs) {
   const filePath = cliArgs.find((a) => !a.startsWith("-"));
   const dryRun = cliArgs.includes("--dry-run");
+  const sourceIdx = cliArgs.indexOf("--source");
+  const sourceName = sourceIdx >= 0 ? cliArgs[sourceIdx + 1] : void 0;
+  const projectIdx = cliArgs.indexOf("--project");
+  const projectName = projectIdx >= 0 ? cliArgs[projectIdx + 1] : void 0;
+  const isTTY = process.stdout.isTTY ?? false;
+  const green = (s) => isTTY ? `\x1B[32m${s}\x1B[0m` : s;
+  const yellow = (s) => isTTY ? `\x1B[33m${s}\x1B[0m` : s;
+  const red = (s) => isTTY ? `\x1B[31m${s}\x1B[0m` : s;
+  const bold = (s) => isTTY ? `\x1B[1m${s}\x1B[0m` : s;
+  const dim = (s) => isTTY ? `\x1B[2m${s}\x1B[0m` : s;
   if (!filePath) {
-    console.error("Errore: specifica il percorso del file JSONL\n  totalrecall import <file.jsonl> [--dry-run]");
+    console.error(
+      "Errore: specifica il percorso del file JSONL\n  totalrecall import <file.jsonl> [--dry-run] [--source <adapter>] [--project <name>]\n  Adapters disponibili: claude-mem"
+    );
     process.exit(1);
   }
-  if (!existsSync7(filePath)) {
+  if (!existsSync8(filePath)) {
     console.error(`Errore: file non trovato: ${filePath}`);
     process.exit(1);
   }
   let content;
   try {
-    content = readFileSync5(filePath, "utf8");
+    content = readFileSync6(filePath, "utf8");
   } catch (err) {
     console.error(`Errore lettura file: ${err.message}`);
     process.exit(1);
   }
+  const { getAdapter: getAdapter2, detectAdapter: detectAdapter2, listAdapters: listAdapters2 } = await Promise.resolve().then(() => (init_adapters(), adapters_exports));
+  const { importJsonl: importJsonl2 } = await Promise.resolve().then(() => (init_ImportExport(), ImportExport_exports));
+  let adapter = sourceName ? getAdapter2(sourceName) : void 0;
+  if (sourceName && !adapter) {
+    const available = listAdapters2();
+    console.error(
+      `Errore: adapter "${sourceName}" non trovato.
+  Adapters disponibili: ${available.join(", ")}`
+    );
+    process.exit(1);
+  }
+  if (!adapter) {
+    adapter = detectAdapter2(content);
+    if (adapter) {
+      console.log(`
+  ${green("\u2713")} Detected format: ${bold(adapter.name)}`);
+    } else if (!looksLikeNativeJsonl(content)) {
+      const available = listAdapters2();
+      console.error(
+        `
+  ${red("\u2717")} Could not auto-detect the file format.
+
+  The file does not match any known import format.
+  Available adapters:
+` + available.map((name) => `    \u2022 ${name}`).join("\n") + `
+
+  To specify the format manually:
+    totalrecall import ${filePath} --source <adapter>
+
+  If this is a native Total Recall JSONL file, ensure it contains
+  records with a "_type" field (observation, summary, or prompt).`
+      );
+      process.exit(1);
+    }
+  }
   if (dryRun) {
     console.log(`
-  [DRY RUN] Analisi di "${filePath}"...
-`);
+  ${dim("[DRY RUN]")} Analisi di "${filePath}"...`);
   } else {
     console.log(`
-  Importazione di "${filePath}"...
-`);
+  Importazione di "${filePath}"...`);
   }
-  const { importJsonl: importJsonl2 } = await Promise.resolve().then(() => (init_ImportExport(), ImportExport_exports));
-  const { formatImportResult: formatImportResult2 } = await Promise.resolve().then(() => (init_cli_utils(), cli_utils_exports));
   const kmDb = new TotalRecallDatabase();
   let result;
   try {
-    result = importJsonl2(kmDb.db, content, dryRun);
+    if (adapter) {
+      console.log(`  Adapter: ${adapter.name}
+`);
+      const adapted = adapter.adapt(content, { defaultProject: projectName });
+      if (dryRun) {
+        printDryRunReport(adapted, {
+          filePath,
+          adapterName: adapter.name,
+          green,
+          yellow,
+          red,
+          bold,
+          dim
+        });
+      }
+      if (!dryRun && adapted.skipped.length > 0) {
+        console.log(`  Record saltati dall'adapter: ${adapted.skipped.length}`);
+        for (const skip of adapted.skipped.slice(0, 10)) {
+          console.log(`    Riga ${skip.line}: ${skip.reason}`);
+        }
+        if (adapted.skipped.length > 10) {
+          console.log(`    ... e altri ${adapted.skipped.length - 10}`);
+        }
+        console.log("");
+      }
+      const jsonlLines = [];
+      for (const obs of adapted.observations) {
+        jsonlLines.push(JSON.stringify(obs));
+      }
+      for (const sum of adapted.summaries) {
+        jsonlLines.push(JSON.stringify(sum));
+      }
+      for (const pmt of adapted.prompts) {
+        jsonlLines.push(JSON.stringify(pmt));
+      }
+      const jsonlContent = jsonlLines.join("\n");
+      result = importJsonl2(kmDb.db, jsonlContent, dryRun);
+      result._adapterCounts = {
+        observations: adapted.observations.length,
+        summaries: adapted.summaries.length,
+        prompts: adapted.prompts.length,
+        rejected: adapted.skipped.length
+      };
+      result.total += adapted.skipped.length;
+      result.errors += adapted.skipped.length;
+      for (const skip of adapted.skipped) {
+        result.errorDetails.push({ line: skip.line, error: skip.reason });
+      }
+    } else {
+      console.log("");
+      result = importJsonl2(kmDb.db, content, dryRun);
+    }
   } finally {
     kmDb.close();
   }
-  const output = formatImportResult2({
-    imported: result.imported,
-    skipped: result.skipped,
-    errors: result.errors,
-    total: result.total,
-    dryRun,
-    errorDetails: result.errorDetails
-  });
-  console.log(output);
+  if (dryRun) {
+    if (!adapter) {
+      const { formatImportResult: formatImportResult2 } = await Promise.resolve().then(() => (init_cli_utils(), cli_utils_exports));
+      console.log(formatImportResult2({
+        imported: result.imported,
+        skipped: result.skipped,
+        errors: result.errors,
+        total: result.total,
+        dryRun,
+        errorDetails: result.errorDetails
+      }));
+    } else {
+      console.log(`
+  ${dim("(Dry run: nessun dato inserito. Rimuovi --dry-run per applicare.)")}
+`);
+    }
+  } else {
+    const counts = result._adapterCounts;
+    if (counts) {
+      const imported = counts.observations + counts.summaries + counts.prompts;
+      const lines = [
+        "",
+        `  ${bold("Import complete.")}`,
+        `  Imported: ${green(String(counts.observations))} observations, ${green(String(counts.summaries))} summaries, ${green(String(counts.prompts))} prompts`,
+        `  Skipped:  ${result.skipped > 0 ? yellow(String(result.skipped)) : String(result.skipped)} duplicates`,
+        `  Rejected: ${counts.rejected > 0 ? red(String(counts.rejected)) : String(counts.rejected)} unsupported`,
+        ""
+      ];
+      console.log(lines.join("\n"));
+    } else {
+      console.log([
+        "",
+        `  ${bold("Import complete.")}`,
+        `  Imported: ${green(String(result.imported))} records`,
+        `  Skipped:  ${result.skipped > 0 ? yellow(String(result.skipped)) : String(result.skipped)} duplicates`,
+        `  Errors:   ${result.errors > 0 ? red(String(result.errors)) : String(result.errors)}`,
+        ""
+      ].join("\n"));
+    }
+  }
   if (result.imported === 0 && result.errors > 0 && result.skipped === 0) {
     process.exit(1);
   }
+}
+function printDryRunReport(adapted, opts) {
+  const { green, yellow, red, bold, dim } = opts;
+  const totalRecords = adapted.observations.length + adapted.summaries.length + adapted.prompts.length + adapted.skipped.length;
+  const importable = adapted.observations.length + adapted.summaries.length + adapted.prompts.length;
+  const rejectionsByReason = /* @__PURE__ */ new Map();
+  for (const skip of adapted.skipped) {
+    const key = categorizeSkipReason(skip.reason);
+    rejectionsByReason.set(key, (rejectionsByReason.get(key) ?? 0) + 1);
+  }
+  console.log(`  ${bold("\u2500\u2500\u2500 Dry Run Report \u2500\u2500\u2500")}`);
+  console.log("");
+  console.log(`  Source:   ${opts.filePath}`);
+  console.log(`  Adapter:  ${opts.adapterName}`);
+  console.log("");
+  console.log(`  ${bold("Records found:")}        ${totalRecords}`);
+  console.log("");
+  console.log(`  ${bold("By type:")}`);
+  console.log(`    Observations:       ${green(String(adapted.observations.length))}`);
+  console.log(`    Summaries:          ${green(String(adapted.summaries.length))}`);
+  console.log(`    Prompts:            ${green(String(adapted.prompts.length))}`);
+  console.log("");
+  console.log(`  ${bold("Would be imported:")}    ${green(String(importable))}`);
+  console.log(`  ${bold("Would be rejected:")}    ${adapted.skipped.length > 0 ? red(String(adapted.skipped.length)) : String(adapted.skipped.length)}`);
+  console.log("");
+  if (rejectionsByReason.size > 0) {
+    console.log(`  ${bold("Rejection reasons:")}`);
+    for (const [reason, count] of rejectionsByReason.entries()) {
+      console.log(`    ${yellow(String(count).padStart(4))}  ${reason}`);
+    }
+    console.log("");
+    const examples = adapted.skipped.slice(0, 5);
+    if (examples.length > 0) {
+      console.log(`  ${dim("Examples of rejected records:")}`);
+      for (const skip of examples) {
+        const idPart = skip.originalId ? ` (${skip.originalId})` : "";
+        const typePart = skip.type ? ` [type=${skip.type}]` : "";
+        console.log(`    Line ${skip.line}${idPart}${typePart}: ${skip.reason}`);
+      }
+      if (adapted.skipped.length > 5) {
+        console.log(`    ${dim(`... and ${adapted.skipped.length - 5} more`)}`);
+      }
+      console.log("");
+    }
+  }
+  const projects = /* @__PURE__ */ new Map();
+  for (const obs of adapted.observations) {
+    projects.set(obs.project, (projects.get(obs.project) ?? 0) + 1);
+  }
+  for (const sum of adapted.summaries) {
+    projects.set(sum.project, (projects.get(sum.project) ?? 0) + 1);
+  }
+  for (const pmt of adapted.prompts) {
+    projects.set(pmt.project, (projects.get(pmt.project) ?? 0) + 1);
+  }
+  if (projects.size > 1) {
+    console.log(`  ${bold("By project:")}`);
+    for (const [proj, count] of [...projects.entries()].sort((a, b) => b[1] - a[1])) {
+      console.log(`    ${String(count).padStart(4)}  ${proj}`);
+    }
+    console.log("");
+  }
+}
+function categorizeSkipReason(reason) {
+  if (reason.startsWith("Unsupported type:")) return "Unsupported record type";
+  if (reason.includes("Empty content")) return "Empty content field";
+  if (reason.includes("Invalid JSON")) return "Invalid JSON line";
+  if (reason.includes("not a JSON object")) return "Non-object JSON value";
+  return reason;
+}
+function looksLikeNativeJsonl(content) {
+  if (!content || content.trim().length === 0) return false;
+  const lines = content.split("\n");
+  let checked = 0;
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (parsed && typeof parsed === "object" && ("_type" in parsed || "_meta" in parsed)) {
+        return true;
+      }
+    } catch {
+    }
+    checked++;
+    if (checked >= 5) break;
+  }
+  return false;
 }
 async function runDoctorFix() {
   console.log("\n=== Total Recall \u2014 Riparazione Database ===\n");
@@ -6741,8 +9680,8 @@ Sottocomandi:
 async function handleWorker(commandName) {
   const host = String(process.env.TOTALRECALL_WORKER_HOST || process.env.CONTEXTKIT_WORKER_HOST || "127.0.0.1");
   const port = String(process.env.TOTALRECALL_WORKER_PORT || process.env.CONTEXTKIT_WORKER_PORT || "3001");
-  const pidFile = join6(DATA_DIR, "worker.pid");
-  const workerPath = join6(DIST_DIR, "worker-service.js");
+  const pidFile = join7(DATA_DIR, "worker.pid");
+  const workerPath = join7(DIST_DIR, "worker-service.js");
   const healthUrl = `http://${host}:${port}/health`;
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   async function isHealthy() {
@@ -6758,8 +9697,8 @@ async function handleWorker(commandName) {
   }
   function readPid() {
     try {
-      if (!existsSync7(pidFile)) return null;
-      const raw = readFileSync5(pidFile, "utf8").trim();
+      if (!existsSync8(pidFile)) return null;
+      const raw = readFileSync6(pidFile, "utf8").trim();
       const pid = Number(raw);
       return Number.isInteger(pid) && pid > 0 ? pid : null;
     } catch {
@@ -6777,7 +9716,7 @@ async function handleWorker(commandName) {
   async function stopWorker() {
     const pid = readPid();
     if (!pid) {
-      if (existsSync7(pidFile)) {
+      if (existsSync8(pidFile)) {
         try {
           unlinkSync3(pidFile);
         } catch {
@@ -6800,7 +9739,7 @@ async function handleWorker(commandName) {
     for (let i = 0; i < 20; i++) {
       if (!processExists(pid)) {
         try {
-          if (existsSync7(pidFile)) unlinkSync3(pidFile);
+          if (existsSync8(pidFile)) unlinkSync3(pidFile);
         } catch {
         }
         return true;
@@ -6814,7 +9753,7 @@ async function handleWorker(commandName) {
     for (let i = 0; i < 10; i++) {
       if (!processExists(pid)) {
         try {
-          if (existsSync7(pidFile)) unlinkSync3(pidFile);
+          if (existsSync8(pidFile)) unlinkSync3(pidFile);
         } catch {
         }
         return true;
@@ -7065,6 +10004,233 @@ async function handleService(subArgs) {
   console.error("  Usage: totalrecall service install|uninstall|status\n");
   process.exit(1);
 }
+async function handleShare(subArgs) {
+  const subCommand = subArgs[0];
+  const port = process.env.TOTALRECALL_WORKER_PORT || process.env.CONTEXTKIT_WORKER_PORT || "3001";
+  const host = process.env.TOTALRECALL_WORKER_HOST || process.env.CONTEXTKIT_WORKER_HOST || "127.0.0.1";
+  const baseUrl = `http://${host}:${port}`;
+  const tokenFile = join7(DATA_DIR, "worker.token");
+  let workerToken;
+  try {
+    workerToken = readFileSync6(tokenFile, "utf-8").trim();
+  } catch {
+    console.error("\n  Error: Cannot read worker token. Is the worker running?");
+    console.error("  Start with: totalrecall worker:start\n");
+    process.exit(1);
+  }
+  async function apiGet(path) {
+    return new Promise((resolve, reject) => {
+      const req = http.get(`${baseUrl}${path}`, { headers: { "X-Worker-Token": workerToken } }, (res) => {
+        let body = "";
+        res.on("data", (chunk) => {
+          body += chunk;
+        });
+        res.on("end", () => {
+          try {
+            resolve({ status: res.statusCode, data: JSON.parse(body) });
+          } catch {
+            reject(new Error(`Non-JSON response: ${body}`));
+          }
+        });
+      });
+      req.on("error", reject);
+      req.setTimeout(5e3, () => {
+        req.destroy(new Error("Timeout"));
+      });
+    });
+  }
+  async function apiPost(path, bodyData) {
+    return new Promise((resolve, reject) => {
+      const payload = JSON.stringify(bodyData);
+      const options = {
+        hostname: host,
+        port: parseInt(port, 10),
+        path,
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Content-Length": Buffer.byteLength(payload),
+          "X-Worker-Token": workerToken
+        }
+      };
+      const req = http.request(options, (res) => {
+        let body = "";
+        res.on("data", (chunk) => {
+          body += chunk;
+        });
+        res.on("end", () => {
+          try {
+            resolve({ status: res.statusCode, data: JSON.parse(body) });
+          } catch {
+            reject(new Error(`Non-JSON response: ${body}`));
+          }
+        });
+      });
+      req.on("error", reject);
+      req.setTimeout(1e4, () => {
+        req.destroy(new Error("Timeout"));
+      });
+      req.write(payload);
+      req.end();
+    });
+  }
+  async function apiDelete(path) {
+    return new Promise((resolve, reject) => {
+      const options = {
+        hostname: host,
+        port: parseInt(port, 10),
+        path,
+        method: "DELETE",
+        headers: { "X-Worker-Token": workerToken }
+      };
+      const req = http.request(options, (res) => {
+        let body = "";
+        res.on("data", (chunk) => {
+          body += chunk;
+        });
+        res.on("end", () => {
+          try {
+            resolve({ status: res.statusCode, data: JSON.parse(body) });
+          } catch {
+            reject(new Error(`Non-JSON response: ${body}`));
+          }
+        });
+      });
+      req.on("error", reject);
+      req.setTimeout(5e3, () => {
+        req.destroy(new Error("Timeout"));
+      });
+      req.end();
+    });
+  }
+  if (!subCommand || subCommand === "help") {
+    console.log(`
+Usage: totalrecall share <subcommand>
+
+Subcommands:
+  create [options]     Create a new read-only sharing token
+  list                 List all sharing tokens
+  revoke <id>          Revoke a sharing token
+
+Options for 'create':
+  --project <name>     Scope token to a specific project (default: all projects)
+  --expires <duration> Token expiration (default: 7d). Format: 7d, 24h, 30m
+  --label <text>       Optional label for the token
+`);
+    return;
+  }
+  if (subCommand === "create") {
+    let project;
+    let expires;
+    let label;
+    for (let i = 1; i < subArgs.length; i++) {
+      const arg = subArgs[i];
+      if (arg === "--project" && subArgs[i + 1]) {
+        project = subArgs[++i];
+      } else if (arg === "--expires" && subArgs[i + 1]) {
+        expires = subArgs[++i];
+      } else if (arg === "--label" && subArgs[i + 1]) {
+        label = subArgs[++i];
+      }
+    }
+    try {
+      const result = await apiPost("/api/sharing/tokens", {
+        project: project || null,
+        expires: expires || "7d",
+        label: label || null
+      });
+      if (result.status !== 201) {
+        console.error(`
+  Error: ${result.data.error || "Failed to create token"}
+`);
+        process.exit(1);
+      }
+      const { id, url, expires_at } = result.data;
+      console.log(`
+=== Total Recall \u2014 Share Token Created ===
+`);
+      console.log(`  ID:        ${id}`);
+      console.log(`  Project:   ${project || "(all projects)"}`);
+      console.log(`  Expires:   ${new Date(expires_at).toLocaleString()}`);
+      if (label) console.log(`  Label:     ${label}`);
+      console.log(`
+  Share URL:`);
+      console.log(`  ${url}
+`);
+    } catch {
+      console.error("\n  Error: Cannot connect to worker. Start with: totalrecall worker:start\n");
+      process.exit(1);
+    }
+    return;
+  }
+  if (subCommand === "list") {
+    try {
+      const result = await apiGet("/api/sharing/tokens");
+      if (result.status !== 200) {
+        console.error(`
+  Error: ${result.data.error || "Failed to list tokens"}
+`);
+        process.exit(1);
+      }
+      const { tokens } = result.data;
+      console.log("\n=== Total Recall \u2014 Sharing Tokens ===\n");
+      if (!tokens || tokens.length === 0) {
+        console.log("  No sharing tokens found.\n");
+        console.log("  Create one with: totalrecall share create --project myapp\n");
+        return;
+      }
+      for (const t of tokens) {
+        const statusIcon = t.is_revoked ? "\u{1F6AB}" : t.is_expired ? "\u23F0" : "\u2705";
+        const status2 = t.is_revoked ? "revoked" : t.is_expired ? "expired" : "active";
+        console.log(`  ${statusIcon} ${t.id}`);
+        console.log(`     Project:  ${t.project || "(all)"}`);
+        console.log(`     Status:   ${status2}`);
+        console.log(`     Expires:  ${new Date(t.expires_at).toLocaleString()}`);
+        console.log(`     Created:  ${new Date(t.created_at).toLocaleString()}`);
+        if (t.label) console.log(`     Label:    ${t.label}`);
+        console.log("");
+      }
+    } catch {
+      console.error("\n  Error: Cannot connect to worker. Start with: totalrecall worker:start\n");
+      process.exit(1);
+    }
+    return;
+  }
+  if (subCommand === "revoke") {
+    const tokenId = subArgs[1];
+    if (!tokenId) {
+      console.error("\n  Error: Token ID is required.");
+      console.error("  Usage: totalrecall share revoke <id>\n");
+      process.exit(1);
+    }
+    try {
+      const result = await apiDelete(`/api/sharing/tokens/${encodeURIComponent(tokenId)}`);
+      if (result.status === 404) {
+        console.error(`
+  Error: Token not found or already revoked.
+`);
+        process.exit(1);
+      }
+      if (result.status !== 200) {
+        console.error(`
+  Error: ${result.data.error || "Failed to revoke token"}
+`);
+        process.exit(1);
+      }
+      console.log(`
+  \u2705 Token ${tokenId} revoked successfully.
+`);
+    } catch {
+      console.error("\n  Error: Cannot connect to worker. Start with: totalrecall worker:start\n");
+      process.exit(1);
+    }
+    return;
+  }
+  console.error(`
+  Unknown share subcommand: ${subCommand}`);
+  console.error("  Usage: totalrecall share create|list|revoke\n");
+  process.exit(1);
+}
 function showHelp() {
   console.log(`Usage: totalrecall <command> [options]
 
@@ -7123,6 +10289,9 @@ Commands:
   plugins list              Elenca tutti i plugin registrati con stato
   plugins enable <nome>     Abilita un plugin registrato
   plugins disable <nome>    Disabilita un plugin attivo
+  share create [options]    Create a read-only sharing token
+  share list                List all sharing tokens
+  share revoke <id>         Revoke a sharing token
   help                      Show this help message
 
 Examples:
@@ -7158,6 +10327,333 @@ Examples:
   totalrecall decay detect-stale
   totalrecall decay consolidate --dry-run
   totalrecall observations 20
+  totalrecall share create --project myapp --expires 7d
+  totalrecall share list
+  totalrecall share revoke <token-id>
 `);
 }
+async function handleUsers(subArgs) {
+  const subCommand = subArgs[0];
+  const port = process.env.TOTALRECALL_WORKER_PORT || process.env.CONTEXTKIT_WORKER_PORT || "3001";
+  const baseUrl = `http://127.0.0.1:${port}`;
+  if (!subCommand || subCommand === "help") {
+    console.log(`
+Usage: totalrecall users <subcommand>
+
+Subcommands:
+  create <email> [options]  Create a new user
+  list                      List all users
+  role <email> <role>       Change user role (admin|editor|viewer)
+  delete <email>            Deactivate a user
+
+Options for 'create':
+  --role <role>     Role: admin, editor, viewer (default: viewer)
+  --name <name>     Display name (default: derived from email)
+  --password <pwd>  Set password (default: auto-generated)
+
+Examples:
+  totalrecall users create admin@example.com --role admin
+  totalrecall users list
+  totalrecall users role user@example.com editor
+  totalrecall users delete old@example.com
+`);
+    return;
+  }
+  if (subCommand === "create") {
+    const email = subArgs[1];
+    if (!email || !email.includes("@")) {
+      console.error("\n  Error: valid email is required.\n  Usage: totalrecall users create <email> --role <role>\n");
+      process.exit(1);
+    }
+    let role = "viewer";
+    let displayName = "";
+    let password = "";
+    for (let i = 2; i < subArgs.length; i++) {
+      const arg = subArgs[i];
+      if (arg === "--role" && subArgs[i + 1]) {
+        role = subArgs[++i];
+      } else if (arg === "--name" && subArgs[i + 1]) {
+        displayName = subArgs[++i];
+      } else if (arg === "--password" && subArgs[i + 1]) {
+        password = subArgs[++i];
+      }
+    }
+    if (!["admin", "editor", "viewer"].includes(role)) {
+      console.error(`
+  Error: invalid role "${role}". Must be admin, editor, or viewer.
+`);
+      process.exit(1);
+    }
+    const db = new TotalRecallDatabase();
+    try {
+      const { getUserByEmail: getUserByEmail2, createUser: createUser2, countAdmins: countAdmins2 } = await Promise.resolve().then(() => (init_Users(), Users_exports));
+      const normalizedEmail = email.toLowerCase().trim();
+      const existing = getUserByEmail2(db.db, normalizedEmail);
+      if (existing) {
+        console.error(`
+  Error: user "${normalizedEmail}" already exists.
+`);
+        process.exit(1);
+      }
+      const crypto2 = await import("crypto");
+      let plainPassword = password || crypto2.randomBytes(16).toString("base64url");
+      let passwordHash;
+      try {
+        const bcrypt = await Promise.resolve().then(() => __toESM(require_bcryptjs(), 1));
+        passwordHash = bcrypt.hashSync(plainPassword, 10);
+      } catch {
+        passwordHash = crypto2.createHash("sha256").update(plainPassword).digest("hex");
+      }
+      const name = displayName || normalizedEmail.split("@")[0] || normalizedEmail;
+      const user = createUser2(db.db, normalizedEmail, passwordHash, role, name);
+      console.log("\n=== User Created ===\n");
+      console.log(`  Email:     ${user.email}`);
+      console.log(`  Role:      ${user.role}`);
+      console.log(`  Name:      ${user.display_name}`);
+      if (!password) {
+        console.log(`  Password:  ${plainPassword}`);
+        console.log("");
+        console.log("  \u26A0\uFE0F  Save this password \u2014 it will not be shown again.");
+      }
+      console.log("");
+    } finally {
+      db.close();
+    }
+    return;
+  }
+  if (subCommand === "list") {
+    const db = new TotalRecallDatabase();
+    try {
+      const { listUsers: listUsers2 } = await Promise.resolve().then(() => (init_Users(), Users_exports));
+      const users = listUsers2(db.db);
+      if (users.length === 0) {
+        console.log("\n  No users found. Create one with: totalrecall users create <email> --role admin\n");
+        return;
+      }
+      console.log("\n=== Total Recall \u2014 Users ===\n");
+      console.log("  " + "Email".padEnd(30) + "Role".padEnd(10) + "Name".padEnd(20) + "Active  Last Login");
+      console.log("  " + "-".repeat(90));
+      for (const user of users) {
+        const active = user.is_active ? "\u2713" : "\u2717";
+        const lastLogin = user.last_login ? new Date(user.last_login).toLocaleString() : "never";
+        console.log(
+          "  " + user.email.padEnd(30) + user.role.padEnd(10) + (user.display_name || "").padEnd(20) + active.padEnd(8) + lastLogin
+        );
+      }
+      console.log("");
+    } finally {
+      db.close();
+    }
+    return;
+  }
+  if (subCommand === "role") {
+    const email = subArgs[1];
+    const newRole = subArgs[2];
+    if (!email || !newRole) {
+      console.error("\n  Usage: totalrecall users role <email> <admin|editor|viewer>\n");
+      process.exit(1);
+    }
+    if (!["admin", "editor", "viewer"].includes(newRole)) {
+      console.error(`
+  Error: invalid role "${newRole}". Must be admin, editor, or viewer.
+`);
+      process.exit(1);
+    }
+    const db = new TotalRecallDatabase();
+    try {
+      const { getUserByEmail: getUserByEmail2, updateUserRole: updateUserRole2, countAdmins: countAdmins2 } = await Promise.resolve().then(() => (init_Users(), Users_exports));
+      const user = getUserByEmail2(db.db, email.toLowerCase().trim());
+      if (!user) {
+        console.error(`
+  Error: user "${email}" not found.
+`);
+        process.exit(1);
+      }
+      if (user.role === "admin" && newRole !== "admin") {
+        const adminCount = countAdmins2(db.db);
+        if (adminCount <= 1) {
+          console.error("\n  Error: cannot remove the last admin.\n");
+          process.exit(1);
+        }
+      }
+      updateUserRole2(db.db, user.id, newRole);
+      console.log(`
+  Updated: ${user.email} role changed from "${user.role}" to "${newRole}"
+`);
+    } finally {
+      db.close();
+    }
+    return;
+  }
+  if (subCommand === "delete") {
+    const email = subArgs[1];
+    if (!email) {
+      console.error("\n  Usage: totalrecall users delete <email>\n");
+      process.exit(1);
+    }
+    const db = new TotalRecallDatabase();
+    try {
+      const { getUserByEmail: getUserByEmail2, deactivateUser: deactivateUser2, countAdmins: countAdmins2 } = await Promise.resolve().then(() => (init_Users(), Users_exports));
+      const user = getUserByEmail2(db.db, email.toLowerCase().trim());
+      if (!user) {
+        console.error(`
+  Error: user "${email}" not found.
+`);
+        process.exit(1);
+      }
+      if (user.role === "admin") {
+        const adminCount = countAdmins2(db.db);
+        if (adminCount <= 1) {
+          console.error("\n  Error: cannot deactivate the last admin.\n");
+          process.exit(1);
+        }
+      }
+      deactivateUser2(db.db, user.id);
+      console.log(`
+  Deactivated: ${user.email}
+`);
+    } finally {
+      db.close();
+    }
+    return;
+  }
+  console.error(`
+  Unknown subcommand: ${subCommand}`);
+  console.error("  Use: totalrecall users help\n");
+  process.exit(1);
+}
+async function handleTeam(subArgs) {
+  const subCommand = subArgs[0];
+  if (!subCommand || subCommand === "help") {
+    console.log(`
+  totalrecall team \u2014 Sync shared knowledge with your team via Git
+
+  Commands:
+    init <repo-url>    Initialize team sync (clone repo, save config)
+    push               Export knowledge \u2192 commit \u2192 push to remote
+    pull               Pull from remote \u2192 import new knowledge (local wins)
+    status             Show sync configuration and state
+
+  Options (init):
+    --interval <min>   Auto-sync interval in minutes (default: 60)
+
+  Examples:
+    totalrecall team init git@github.com:my-org/shared-knowledge.git
+    totalrecall team push
+    totalrecall team pull
+    totalrecall team status
+`);
+    return;
+  }
+  if (subCommand === "init") {
+    const repoUrl = subArgs[1];
+    if (!repoUrl) {
+      console.error("  Error: Please provide a repository URL.\n  Example: totalrecall team init git@github.com:org/repo.git\n");
+      process.exit(1);
+    }
+    const intervalIdx = subArgs.indexOf("--interval");
+    const syncInterval = intervalIdx >= 0 ? parseInt(subArgs[intervalIdx + 1] ?? "60", 10) : 60;
+    try {
+      const config = initTeamConfig(repoUrl, { syncInterval });
+      console.log(`
+  \u2705 Team sync initialized.`);
+      console.log(`     Repo: ${config.repoUrl}`);
+      console.log(`     Local: ${config.localPath}`);
+      console.log(`     Sync interval: ${config.syncInterval} min
+`);
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      console.error(`  \u274C Failed to initialize team sync: ${msg}
+`);
+      process.exit(1);
+    }
+    return;
+  }
+  if (subCommand === "push") {
+    const config = loadTeamConfig();
+    if (!config) {
+      console.error("  \u274C Team sync not initialized. Run: totalrecall team init <repo-url>\n");
+      process.exit(1);
+    }
+    const db = new TotalRecallDatabase();
+    try {
+      console.log("  Exporting knowledge and pushing...");
+      const result = pushKnowledge(db.db, config);
+      console.log(`
+  \u2705 Push complete.`);
+      console.log(`     Exported: ${result.exported} items`);
+      if (result.errors.length > 0) {
+        console.log(`     \u26A0\uFE0F  Errors:`);
+        for (const err of result.errors) {
+          console.log(`        - ${err}`);
+        }
+      }
+      console.log("");
+    } finally {
+      db.close();
+    }
+    return;
+  }
+  if (subCommand === "pull") {
+    const config = loadTeamConfig();
+    if (!config) {
+      console.error("  \u274C Team sync not initialized. Run: totalrecall team init <repo-url>\n");
+      process.exit(1);
+    }
+    const db = new TotalRecallDatabase();
+    try {
+      console.log("  Pulling from remote and importing...");
+      const result = pullKnowledge(db.db, config);
+      console.log(`
+  \u2705 Pull complete.`);
+      console.log(`     Imported: ${result.imported} items`);
+      if (result.conflicts.length > 0) {
+        console.log(`     \u2139\uFE0F  Conflicts (local wins):`);
+        for (const conflict of result.conflicts) {
+          console.log(`        - ${conflict}`);
+        }
+      }
+      if (result.errors.length > 0) {
+        console.log(`     \u26A0\uFE0F  Errors:`);
+        for (const err of result.errors) {
+          console.log(`        - ${err}`);
+        }
+      }
+      console.log("");
+    } finally {
+      db.close();
+    }
+    return;
+  }
+  if (subCommand === "status") {
+    const config = loadTeamConfig();
+    if (!config) {
+      console.log("\n  Team sync: not configured");
+      console.log("  Run: totalrecall team init <repo-url>\n");
+      return;
+    }
+    const status2 = getTeamStatus(config);
+    console.log(`
+  \u{1F4E1} Team Sync Status`);
+    console.log(`     Repo:       ${status2.repoUrl}`);
+    console.log(`     Local path: ${status2.localPath}`);
+    console.log(`     Last sync:  ${status2.lastSync || "never"}`);
+    console.log(`     Interval:   ${status2.syncInterval} min`);
+    console.log(`     Shared items: ${status2.localKnowledgeCount} files
+`);
+    return;
+  }
+  console.error(`  Unknown team subcommand: ${subCommand}`);
+  console.error("  Use: init | push | pull | status\n");
+  process.exit(1);
+}
 main().catch(console.error);
+/*! Bundled license information:
+
+bcryptjs/dist/bcrypt.js:
+  (**
+   * @license bcrypt.js (c) 2013 Daniel Wirtz <dcode@dcode.io>
+   * Released under the Apache License, Version 2.0
+   * see: https://github.com/dcodeIO/bcrypt.js for details
+   *)
+*/

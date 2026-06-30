@@ -1,18 +1,20 @@
 {
-  // UI layer: React components + dashboard.
+  // Shared foundation: types, db, utils, shared — lightweight modules used by all layers.
+  // Checked independently to avoid redundant resolution in runtime/product/services.
   // Part of the typecheck split to fix OOM (issue #67).
   "extends": "./tsconfig.json",
   "compilerOptions": {
-    "jsx": "react-jsx",
-    "lib": ["ES2022", "DOM", "DOM.Iterable"],
     "noEmit": true,
     "declaration": false,
     "declarationMap": false,
     "sourceMap": false
   },
   "include": [
-    "src/ui/**/*",
-    "src/shared/version.ts"
+    "src/shared/**/*",
+    "src/types/**/*",
+    "src/db/**/*",
+    "src/utils/**/*",
+    "src/shims/**/*"
   ],
   "exclude": [
     "node_modules",

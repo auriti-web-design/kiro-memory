@@ -1,19 +1,29 @@
 {
+  // Product layer: SDK, MCP server, plugins, and main entry point.
+  // Services are in tsconfig.services.json (split to prevent OOM — issue #67).
+  //
+  // The @modelcontextprotocol/sdk types are stubbed via `paths` because the full SDK
+  // type declarations (8136 lines, 3128 Zod type references) cause TypeScript to
+  // exhaust the 4GB heap. The stubs provide the minimal API surface actually used.
   "extends": "./tsconfig.json",
   "compilerOptions": {
     "jsx": "preserve",
     "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "noEmit": true,
     "declaration": false,
     "declarationMap": false,
     "sourceMap": false,
-    "noEmit": true
+    "baseUrl": ".",
+    "paths": {
+      "@modelcontextprotocol/sdk/server/mcp.js": ["src/types/mcp-stubs/server-mcp.d.ts"],
+      "@modelcontextprotocol/sdk/server/stdio.js": ["src/types/mcp-stubs/server-stdio.d.ts"]
+    }
   },
   "include": [
     "src/index.ts",
     "src/plugins/**/*",
     "src/sdk/**/*",
     "src/servers/**/*",
-    "src/services/**/*",
     "src/shared/**/*",
     "src/types/**/*",
     "src/db/**/*",
@@ -22,10 +32,10 @@
   "exclude": [
     "node_modules",
     "dist",
-    "plugin",
     "tests",
     "src/ui/**/*",
     "src/cli/**/*",
-    "src/hooks/**/*"
+    "src/hooks/**/*",
+    "src/services/**/*"
   ]
 }

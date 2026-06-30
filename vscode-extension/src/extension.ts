@@ -27,10 +27,14 @@ import { SessionsProvider }      from './providers/sessions-provider';
 // Client API worker
 import { TotalRecallClient }      from './api-client';
 
+// Providers aggiuntivi
+import { TotalRecallCodeLensProvider }             from './providers/codelens-provider';
+
 // Comandi
 import { searchCommand, openObservationInEditor } from './commands/search';
 import { showDashboardCommand }                   from './commands/dashboard';
 import { showContextCommand }                     from './commands/context';
+import { quickPickCommand, showFileObservationsCommand } from './commands/quick-pick';
 
 // WebView
 import { createDashboardPanel }                   from './views/dashboard-panel';
@@ -77,6 +81,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     vscode.window.registerTreeDataProvider('kiroMemory.sessions',     sessionsProvider)
   );
 
+  // ── CodeLens Provider ────────────────────────────────────────────────────
+
+  const codeLensProvider = new TotalRecallCodeLensProvider(client);
+  context.subscriptions.push(
+    vscode.languages.registerCodeLensProvider(
+      { scheme: 'file' }, // tutti i file locali
+      codeLensProvider
+    )
+  );
+
   // ── Status Bar ───────────────────────────────────────────────────────────
 
   statusBarItem = vscode.window.createStatusBarItem(
@@ -93,13 +107,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   // ── Auto-refresh ─────────────────────────────────────────────────────────
 
+  const autoRefreshEnabled = config.get<boolean>('autoRefresh', true);
   const refreshIntervalSec = config.get<number>('refreshInterval', AUTO_REFRESH_INTERVAL_DEFAULT);
-  startAutoRefresh(
-    refreshIntervalSec,
-    client,
-    statusBarItem,
-    [projectsProvider, observationsProvider, sessionsProvider]
-  );
+  if (autoRefreshEnabled) {
+    startAutoRefresh(
+      refreshIntervalSec,
+      client,
+      statusBarItem,
+      [projectsProvider, observationsProvider, sessionsProvider, codeLensProvider]
+    );
+  }
 
   // ── Registrazione comandi ────────────────────────────────────────────────
 
@@ -165,6 +182,26 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     })
   );
 
+  // kiroMemory.quickSearch — Ricerca rapida con keybinding Ctrl+Shift+K
+  context.subscriptions.push(
+    vscode.commands.registerCommand('kiroMemory.quickSearch', async () => {
+      await quickPickCommand(client);
+    })
+  );
+
+  // kiroMemory.showFileObservations — Apri QuickPick con osservazioni per un file (da CodeLens)
+  context.subscriptions.push(
+    vscode.commands.registerCommand(
+      'kiroMemory.showFileObservations',
+      async (observations: unknown[], filePath: string) => {
+        await showFileObservationsCommand(
+          observations as import('./api-client').Observation[],
+          filePath
+        );
+      }
+    )
+  );
+
   // ── Listener impostazioni ────────────────────────────────────────────────
 
   context.subscriptions.push(
@@ -182,13 +219,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
       // Riavvia auto-refresh con il nuovo intervallo
       const newInterval = newConfig.get<number>('refreshInterval', AUTO_REFRESH_INTERVAL_DEFAULT);
+      const newAutoRefresh = newConfig.get<boolean>('autoRefresh', true);
       stopAutoRefresh();
-      startAutoRefresh(
-        newInterval,
-        client,
-        statusBarItem!,
-        [projectsProvider, observationsProvider, sessionsProvider]
-      );
+      if (newAutoRefresh) {
+        startAutoRefresh(
+          newInterval,
+          client,
+          statusBarItem!,
+          [projectsProvider, observationsProvider, sessionsProvider, codeLensProvider]
+        );
+      }
 
       // Refresh immediato dopo cambio configurazione
       vscode.commands.executeCommand('kiroMemory.refresh');

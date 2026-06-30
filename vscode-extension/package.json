@@ -71,6 +71,15 @@
         "command": "kiroMemory.refresh",
         "title": "Total Recall: Refresh",
         "icon": "$(refresh)"
+      },
+      {
+        "command": "kiroMemory.quickSearch",
+        "title": "Total Recall: Quick Search (Ctrl+Shift+K)",
+        "icon": "$(zap)"
+      },
+      {
+        "command": "kiroMemory.showFileObservations",
+        "title": "Total Recall: Show File Observations"
       }
     ],
     "menus": {
@@ -113,9 +122,23 @@
         },
         {
           "command": "kiroMemory.refresh"
+        },
+        {
+          "command": "kiroMemory.quickSearch"
+        },
+        {
+          "command": "kiroMemory.showFileObservations",
+          "when": "false"
         }
       ]
     },
+    "keybindings": [
+      {
+        "command": "kiroMemory.quickSearch",
+        "key": "ctrl+shift+k",
+        "mac": "cmd+shift+k"
+      }
+    ],
     "configuration": {
       "title": "Total Recall",
       "properties": {
@@ -137,6 +160,11 @@
           "minimum": 10,
           "maximum": 300,
           "description": "Intervallo di aggiornamento automatico in secondi (default: 30)"
+        },
+        "kiroMemory.autoRefresh": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable automatic periodic refresh of tree views and status bar"
         },
         "kiroMemory.maxObservations": {
           "type": "number",

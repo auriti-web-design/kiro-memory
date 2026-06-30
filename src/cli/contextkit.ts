@@ -23,10 +23,20 @@ import {
 import { TotalRecallDatabase } from '../services/sqlite/Database.js';
 import { getObservationsByProject } from '../services/sqlite/Observations.js';
 import { createBackup, listBackups, restoreBackup, rotateBackups } from '../services/sqlite/Backup.js';
+import {
+  loadTeamConfig,
+  initTeamConfig,
+  exportKnowledge,
+  importKnowledge,
+  pushKnowledge,
+  pullKnowledge,
+  getTeamStatus,
+} from '../services/team/index.js';
+import type { TeamConfig } from '../services/team/index.js';
 import { DB_PATH, BACKUPS_DIR, DATA_DIR, KIRO_CONFIG_DIR } from '../shared/paths.js';
 import { execSync } from 'child_process';
 import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync, unlinkSync } from 'fs';
-import { join, dirname } from 'path';
+import { join, dirname, basename } from 'path';
 import { homedir, platform, release } from 'os';
 import { fileURLToPath } from 'url';
 import { createInterface } from 'readline';
@@ -34,6 +44,12 @@ import * as http from 'http';
 
 const args = process.argv.slice(2);
 const command = args[0];
+
+// Legacy alias deprecation notice
+const binName = basename(process.argv[1] ?? '');
+if (binName === 'kiro-memory') {
+  console.error('Note: "kiro-memory" is a legacy alias. The canonical command is "totalrecall".\n');
+}
 
 // Detect the dist path from the current file (bundled by esbuild)
 const __filename = fileURLToPath(import.meta.url);
@@ -1328,6 +1344,11 @@ async function main() {
     return;
   }
 
+  if (command === 'share') {
+    await handleShare(args.slice(1));
+    return;
+  }
+
   if (command === 'worker:start' || command === 'worker:stop' || command === 'worker:restart' || command === 'worker:status') {
     await handleWorker(command);
     return;
@@ -1340,6 +1361,16 @@ async function main() {
 
   if (command === 'plugins') {
     await handlePlugins(args.slice(1));
+    return;
+  }
+
+  if (command === 'users') {
+    await handleUsers(args.slice(1));
+    return;
+  }
+
+  if (command === 'team') {
+    await handleTeam(args.slice(1));
     return;
   }
 
@@ -2098,15 +2129,38 @@ async function exportObservations(sdk: ReturnType<typeof createTotalRecall>, cli
 
 /**
  * Importa observations, summaries e prompts da un file JSONL.
- * Supporta deduplication e dry-run.
+ * Supporta deduplication, dry-run, e import adapters per formati esterni.
+ *
+ * Usage:
+ *   totalrecall import <file.jsonl> [--dry-run] [--source <adapter>] [--project <name>]
+ *
+ * --source: Specify the source format adapter (e.g. "claude-mem").
+ *           If omitted, auto-detection is attempted. Falls back to native JSONL.
+ * --project: Default project name for records missing a project field.
  */
 async function importObservations(cliArgs: string[]) {
-  // Argomento posizionale: percorso file
+  // Parse arguments
   const filePath = cliArgs.find(a => !a.startsWith('-'));
   const dryRun = cliArgs.includes('--dry-run');
+  const sourceIdx = cliArgs.indexOf('--source');
+  const sourceName = sourceIdx >= 0 ? cliArgs[sourceIdx + 1] : undefined;
+  const projectIdx = cliArgs.indexOf('--project');
+  const projectName = projectIdx >= 0 ? cliArgs[projectIdx + 1] : undefined;
+
+  // Color helpers (TTY-aware)
+  const isTTY = process.stdout.isTTY ?? false;
+  const green = (s: string) => isTTY ? `\x1b[32m${s}\x1b[0m` : s;
+  const yellow = (s: string) => isTTY ? `\x1b[33m${s}\x1b[0m` : s;
+  const red = (s: string) => isTTY ? `\x1b[31m${s}\x1b[0m` : s;
+  const bold = (s: string) => isTTY ? `\x1b[1m${s}\x1b[0m` : s;
+  const dim = (s: string) => isTTY ? `\x1b[2m${s}\x1b[0m` : s;
 
   if (!filePath) {
-    console.error('Errore: specifica il percorso del file JSONL\n  totalrecall import <file.jsonl> [--dry-run]');
+    console.error(
+      'Errore: specifica il percorso del file JSONL\n' +
+      '  totalrecall import <file.jsonl> [--dry-run] [--source <adapter>] [--project <name>]\n' +
+      '  Adapters disponibili: claude-mem'
+    );
     process.exit(1);
   }
 
@@ -2123,39 +2177,292 @@ async function importObservations(cliArgs: string[]) {
     process.exit(1);
   }
 
-  if (dryRun) {
-    console.log(`\n  [DRY RUN] Analisi di "${filePath}"...\n`);
-  } else {
-    console.log(`\n  Importazione di "${filePath}"...\n`);
+  // Determine if we should use an adapter
+  const { getAdapter, detectAdapter, listAdapters } = await import('../services/sqlite/adapters/index.js');
+  const { importJsonl } = await import('../services/sqlite/ImportExport.js');
+
+  let adapter = sourceName ? getAdapter(sourceName) : undefined;
+
+  // If --source was specified but adapter not found, error out
+  if (sourceName && !adapter) {
+    const available = listAdapters();
+    console.error(
+      `Errore: adapter "${sourceName}" non trovato.\n` +
+      `  Adapters disponibili: ${available.join(', ')}`
+    );
+    process.exit(1);
   }
 
-  const { importJsonl } = await import('../services/sqlite/ImportExport.js');
-  const { formatImportResult } = await import('./cli-utils.js');
+  // Auto-detect if no --source specified
+  if (!adapter) {
+    adapter = detectAdapter(content);
+    if (adapter) {
+      console.log(`\n  ${green('✓')} Detected format: ${bold(adapter.name)}`);
+    } else if (!looksLikeNativeJsonl(content)) {
+      // Autodetect failed and it's not native JSONL — show helpful message and exit
+      const available = listAdapters();
+      console.error(
+        `\n  ${red('✗')} Could not auto-detect the file format.\n\n` +
+        `  The file does not match any known import format.\n` +
+        `  Available adapters:\n` +
+        available.map(name => `    • ${name}`).join('\n') + '\n\n' +
+        `  To specify the format manually:\n` +
+        `    totalrecall import ${filePath} --source <adapter>\n\n` +
+        `  If this is a native Total Recall JSONL file, ensure it contains\n` +
+        `  records with a "_type" field (observation, summary, or prompt).`
+      );
+      process.exit(1);
+    }
+    // else: native JSONL — proceed without adapter
+  }
+
+  if (dryRun) {
+    console.log(`\n  ${dim('[DRY RUN]')} Analisi di "${filePath}"...`);
+  } else {
+    console.log(`\n  Importazione di "${filePath}"...`);
+  }
 
   const kmDb = new TotalRecallDatabase();
   let result;
 
   try {
-    result = importJsonl(kmDb.db, content, dryRun);
+    if (adapter) {
+      // Use adapter to transform, then import via standard pipeline
+      console.log(`  Adapter: ${adapter.name}\n`);
+      const adapted = adapter.adapt(content, { defaultProject: projectName });
+
+      // Enhanced dry-run reporting
+      if (dryRun) {
+        printDryRunReport(adapted, {
+          filePath,
+          adapterName: adapter.name,
+          green, yellow, red, bold, dim,
+        });
+      }
+
+      // Report skipped records (non-dry-run still gets brief info)
+      if (!dryRun && adapted.skipped.length > 0) {
+        console.log(`  Record saltati dall'adapter: ${adapted.skipped.length}`);
+        for (const skip of adapted.skipped.slice(0, 10)) {
+          console.log(`    Riga ${skip.line}: ${skip.reason}`);
+        }
+        if (adapted.skipped.length > 10) {
+          console.log(`    ... e altri ${adapted.skipped.length - 10}`);
+        }
+        console.log('');
+      }
+
+      // Convert adapted records back to JSONL for the standard import pipeline
+      const jsonlLines: string[] = [];
+      for (const obs of adapted.observations) {
+        jsonlLines.push(JSON.stringify(obs));
+      }
+      for (const sum of adapted.summaries) {
+        jsonlLines.push(JSON.stringify(sum));
+      }
+      for (const pmt of adapted.prompts) {
+        jsonlLines.push(JSON.stringify(pmt));
+      }
+
+      const jsonlContent = jsonlLines.join('\n');
+      result = importJsonl(kmDb.db, jsonlContent, dryRun);
+
+      // Augment result with adapter-level counts for summary
+      (result as any)._adapterCounts = {
+        observations: adapted.observations.length,
+        summaries: adapted.summaries.length,
+        prompts: adapted.prompts.length,
+        rejected: adapted.skipped.length,
+      };
+
+      // Add adapter-skipped to the error count for reporting
+      result.total += adapted.skipped.length;
+      result.errors += adapted.skipped.length;
+      for (const skip of adapted.skipped) {
+        result.errorDetails.push({ line: skip.line, error: skip.reason });
+      }
+    } else {
+      // Native Total Recall JSONL format
+      console.log('');
+      result = importJsonl(kmDb.db, content, dryRun);
+    }
   } finally {
     kmDb.close();
   }
 
-  const output = formatImportResult({
-    imported: result.imported,
-    skipped: result.skipped,
-    errors: result.errors,
-    total: result.total,
-    dryRun,
-    errorDetails: result.errorDetails,
-  });
+  // Print final summary
+  if (dryRun) {
+    // For dry-run with adapter, the detailed report was already printed above.
+    // Just add a footer note.
+    if (!adapter) {
+      // Native JSONL dry-run — use existing format
+      const { formatImportResult } = await import('./cli-utils.js');
+      console.log(formatImportResult({
+        imported: result.imported,
+        skipped: result.skipped,
+        errors: result.errors,
+        total: result.total,
+        dryRun,
+        errorDetails: result.errorDetails,
+      }));
+    } else {
+      console.log(`\n  ${dim('(Dry run: nessun dato inserito. Rimuovi --dry-run per applicare.)')}\n`);
+    }
+  } else {
+    // Non-dry-run — print colored import summary
+    const counts = (result as any)._adapterCounts as
+      | { observations: number; summaries: number; prompts: number; rejected: number }
+      | undefined;
 
-  console.log(output);
+    if (counts) {
+      // Adapter-aware summary
+      const imported = counts.observations + counts.summaries + counts.prompts;
+      const lines = [
+        '',
+        `  ${bold('Import complete.')}`,
+        `  Imported: ${green(String(counts.observations))} observations, ${green(String(counts.summaries))} summaries, ${green(String(counts.prompts))} prompts`,
+        `  Skipped:  ${result.skipped > 0 ? yellow(String(result.skipped)) : String(result.skipped)} duplicates`,
+        `  Rejected: ${counts.rejected > 0 ? red(String(counts.rejected)) : String(counts.rejected)} unsupported`,
+        '',
+      ];
+      console.log(lines.join('\n'));
+    } else {
+      // Native JSONL summary
+      console.log([
+        '',
+        `  ${bold('Import complete.')}`,
+        `  Imported: ${green(String(result.imported))} records`,
+        `  Skipped:  ${result.skipped > 0 ? yellow(String(result.skipped)) : String(result.skipped)} duplicates`,
+        `  Errors:   ${result.errors > 0 ? red(String(result.errors)) : String(result.errors)}`,
+        '',
+      ].join('\n'));
+    }
+  }
 
   // Exit con codice 1 se ci sono solo errori e nessun import
   if (result.imported === 0 && result.errors > 0 && result.skipped === 0) {
     process.exit(1);
   }
+}
+
+/**
+ * Print a detailed dry-run report showing breakdown by type,
+ * what would be imported vs skipped, and rejection details.
+ */
+function printDryRunReport(
+  adapted: import('../services/sqlite/adapters/index.js').AdaptedImport,
+  opts: {
+    filePath: string;
+    adapterName: string;
+    green: (s: string) => string;
+    yellow: (s: string) => string;
+    red: (s: string) => string;
+    bold: (s: string) => string;
+    dim: (s: string) => string;
+  }
+) {
+  const { green, yellow, red, bold, dim } = opts;
+
+  const totalRecords = adapted.observations.length + adapted.summaries.length + adapted.prompts.length + adapted.skipped.length;
+  const importable = adapted.observations.length + adapted.summaries.length + adapted.prompts.length;
+
+  // Count rejections by reason category
+  const rejectionsByReason = new Map<string, number>();
+  for (const skip of adapted.skipped) {
+    const key = categorizeSkipReason(skip.reason);
+    rejectionsByReason.set(key, (rejectionsByReason.get(key) ?? 0) + 1);
+  }
+
+  console.log(`  ${bold('─── Dry Run Report ───')}`);
+  console.log('');
+  console.log(`  Source:   ${opts.filePath}`);
+  console.log(`  Adapter:  ${opts.adapterName}`);
+  console.log('');
+  console.log(`  ${bold('Records found:')}        ${totalRecords}`);
+  console.log('');
+  console.log(`  ${bold('By type:')}`);
+  console.log(`    Observations:       ${green(String(adapted.observations.length))}`);
+  console.log(`    Summaries:          ${green(String(adapted.summaries.length))}`);
+  console.log(`    Prompts:            ${green(String(adapted.prompts.length))}`);
+  console.log('');
+  console.log(`  ${bold('Would be imported:')}    ${green(String(importable))}`);
+  console.log(`  ${bold('Would be rejected:')}    ${adapted.skipped.length > 0 ? red(String(adapted.skipped.length)) : String(adapted.skipped.length)}`);
+  console.log('');
+
+  if (rejectionsByReason.size > 0) {
+    console.log(`  ${bold('Rejection reasons:')}`);
+    for (const [reason, count] of rejectionsByReason.entries()) {
+      console.log(`    ${yellow(String(count).padStart(4))}  ${reason}`);
+    }
+    console.log('');
+
+    // Show first few rejected records as examples
+    const examples = adapted.skipped.slice(0, 5);
+    if (examples.length > 0) {
+      console.log(`  ${dim('Examples of rejected records:')}`);
+      for (const skip of examples) {
+        const idPart = skip.originalId ? ` (${skip.originalId})` : '';
+        const typePart = skip.type ? ` [type=${skip.type}]` : '';
+        console.log(`    Line ${skip.line}${idPart}${typePart}: ${skip.reason}`);
+      }
+      if (adapted.skipped.length > 5) {
+        console.log(`    ${dim(`... and ${adapted.skipped.length - 5} more`)}`);
+      }
+      console.log('');
+    }
+  }
+
+  // Show project breakdown if multiple projects detected
+  const projects = new Map<string, number>();
+  for (const obs of adapted.observations) {
+    projects.set(obs.project, (projects.get(obs.project) ?? 0) + 1);
+  }
+  for (const sum of adapted.summaries) {
+    projects.set(sum.project, (projects.get(sum.project) ?? 0) + 1);
+  }
+  for (const pmt of adapted.prompts) {
+    projects.set(pmt.project, (projects.get(pmt.project) ?? 0) + 1);
+  }
+
+  if (projects.size > 1) {
+    console.log(`  ${bold('By project:')}`);
+    for (const [proj, count] of [...projects.entries()].sort((a, b) => b[1] - a[1])) {
+      console.log(`    ${String(count).padStart(4)}  ${proj}`);
+    }
+    console.log('');
+  }
+}
+
+/** Categorize a skip reason into a human-friendly bucket */
+function categorizeSkipReason(reason: string): string {
+  if (reason.startsWith('Unsupported type:')) return 'Unsupported record type';
+  if (reason.includes('Empty content')) return 'Empty content field';
+  if (reason.includes('Invalid JSON')) return 'Invalid JSON line';
+  if (reason.includes('not a JSON object')) return 'Non-object JSON value';
+  return reason;
+}
+
+/**
+ * Quick check if content looks like native Total Recall JSONL.
+ * Checks first few non-empty lines for `_type` or `_meta` fields.
+ */
+function looksLikeNativeJsonl(content: string): boolean {
+  if (!content || content.trim().length === 0) return false;
+  const lines = content.split('\n');
+  let checked = 0;
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (parsed && typeof parsed === 'object' && ('_type' in parsed || '_meta' in parsed)) {
+        return true;
+      }
+    } catch { /* skip */ }
+    checked++;
+    if (checked >= 5) break;
+  }
+  return false;
 }
 
 // ─── Comando: doctor --fix ───
@@ -2838,6 +3145,227 @@ async function handleService(subArgs: string[]): Promise<void> {
   process.exit(1);
 }
 
+// ─── Share command ───
+
+/**
+ * Handles `totalrecall share <subcommand>`.
+ * Manages read-only sharing tokens via the worker API.
+ */
+async function handleShare(subArgs: string[]): Promise<void> {
+  const subCommand = subArgs[0];
+  const port = process.env.TOTALRECALL_WORKER_PORT || process.env.CONTEXTKIT_WORKER_PORT || '3001';
+  const host = process.env.TOTALRECALL_WORKER_HOST || process.env.CONTEXTKIT_WORKER_HOST || '127.0.0.1';
+  const baseUrl = `http://${host}:${port}`;
+  const tokenFile = join(DATA_DIR, 'worker.token');
+
+  // Read the worker auth token
+  let workerToken: string;
+  try {
+    workerToken = readFileSync(tokenFile, 'utf-8').trim();
+  } catch {
+    console.error('\n  Error: Cannot read worker token. Is the worker running?');
+    console.error('  Start with: totalrecall worker:start\n');
+    process.exit(1);
+  }
+
+  // HTTP helpers with worker auth
+  async function apiGet(path: string): Promise<{ status: number; data: any }> {
+    return new Promise((resolve, reject) => {
+      const req = http.get(`${baseUrl}${path}`, { headers: { 'X-Worker-Token': workerToken } }, (res) => {
+        let body = '';
+        res.on('data', (chunk: string) => { body += chunk; });
+        res.on('end', () => {
+          try { resolve({ status: res.statusCode!, data: JSON.parse(body) }); }
+          catch { reject(new Error(`Non-JSON response: ${body}`)); }
+        });
+      });
+      req.on('error', reject);
+      req.setTimeout(5000, () => { req.destroy(new Error('Timeout')); });
+    });
+  }
+
+  async function apiPost(path: string, bodyData: Record<string, unknown>): Promise<{ status: number; data: any }> {
+    return new Promise((resolve, reject) => {
+      const payload = JSON.stringify(bodyData);
+      const options = {
+        hostname: host,
+        port: parseInt(port, 10),
+        path,
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(payload),
+          'X-Worker-Token': workerToken,
+        }
+      };
+      const req = http.request(options, (res) => {
+        let body = '';
+        res.on('data', (chunk: string) => { body += chunk; });
+        res.on('end', () => {
+          try { resolve({ status: res.statusCode!, data: JSON.parse(body) }); }
+          catch { reject(new Error(`Non-JSON response: ${body}`)); }
+        });
+      });
+      req.on('error', reject);
+      req.setTimeout(10_000, () => { req.destroy(new Error('Timeout')); });
+      req.write(payload);
+      req.end();
+    });
+  }
+
+  async function apiDelete(path: string): Promise<{ status: number; data: any }> {
+    return new Promise((resolve, reject) => {
+      const options = {
+        hostname: host,
+        port: parseInt(port, 10),
+        path,
+        method: 'DELETE',
+        headers: { 'X-Worker-Token': workerToken }
+      };
+      const req = http.request(options, (res) => {
+        let body = '';
+        res.on('data', (chunk: string) => { body += chunk; });
+        res.on('end', () => {
+          try { resolve({ status: res.statusCode!, data: JSON.parse(body) }); }
+          catch { reject(new Error(`Non-JSON response: ${body}`)); }
+        });
+      });
+      req.on('error', reject);
+      req.setTimeout(5000, () => { req.destroy(new Error('Timeout')); });
+      req.end();
+    });
+  }
+
+  if (!subCommand || subCommand === 'help') {
+    console.log(`
+Usage: totalrecall share <subcommand>
+
+Subcommands:
+  create [options]     Create a new read-only sharing token
+  list                 List all sharing tokens
+  revoke <id>          Revoke a sharing token
+
+Options for 'create':
+  --project <name>     Scope token to a specific project (default: all projects)
+  --expires <duration> Token expiration (default: 7d). Format: 7d, 24h, 30m
+  --label <text>       Optional label for the token
+`);
+    return;
+  }
+
+  if (subCommand === 'create') {
+    // Parse flags
+    let project: string | undefined;
+    let expires: string | undefined;
+    let label: string | undefined;
+
+    for (let i = 1; i < subArgs.length; i++) {
+      const arg = subArgs[i]!;
+      if (arg === '--project' && subArgs[i + 1]) {
+        project = subArgs[++i];
+      } else if (arg === '--expires' && subArgs[i + 1]) {
+        expires = subArgs[++i];
+      } else if (arg === '--label' && subArgs[i + 1]) {
+        label = subArgs[++i];
+      }
+    }
+
+    try {
+      const result = await apiPost('/api/sharing/tokens', {
+        project: project || null,
+        expires: expires || '7d',
+        label: label || null,
+      });
+
+      if (result.status !== 201) {
+        console.error(`\n  Error: ${result.data.error || 'Failed to create token'}\n`);
+        process.exit(1);
+      }
+
+      const { id, url, expires_at } = result.data;
+      console.log(`\n=== Total Recall — Share Token Created ===\n`);
+      console.log(`  ID:        ${id}`);
+      console.log(`  Project:   ${project || '(all projects)'}`);
+      console.log(`  Expires:   ${new Date(expires_at).toLocaleString()}`);
+      if (label) console.log(`  Label:     ${label}`);
+      console.log(`\n  Share URL:`);
+      console.log(`  ${url}\n`);
+    } catch {
+      console.error('\n  Error: Cannot connect to worker. Start with: totalrecall worker:start\n');
+      process.exit(1);
+    }
+    return;
+  }
+
+  if (subCommand === 'list') {
+    try {
+      const result = await apiGet('/api/sharing/tokens');
+
+      if (result.status !== 200) {
+        console.error(`\n  Error: ${result.data.error || 'Failed to list tokens'}\n`);
+        process.exit(1);
+      }
+
+      const { tokens } = result.data;
+      console.log('\n=== Total Recall — Sharing Tokens ===\n');
+
+      if (!tokens || tokens.length === 0) {
+        console.log('  No sharing tokens found.\n');
+        console.log('  Create one with: totalrecall share create --project myapp\n');
+        return;
+      }
+
+      for (const t of tokens) {
+        const statusIcon = t.is_revoked ? '🚫' : t.is_expired ? '⏰' : '✅';
+        const status = t.is_revoked ? 'revoked' : t.is_expired ? 'expired' : 'active';
+        console.log(`  ${statusIcon} ${t.id}`);
+        console.log(`     Project:  ${t.project || '(all)'}`);
+        console.log(`     Status:   ${status}`);
+        console.log(`     Expires:  ${new Date(t.expires_at).toLocaleString()}`);
+        console.log(`     Created:  ${new Date(t.created_at).toLocaleString()}`);
+        if (t.label) console.log(`     Label:    ${t.label}`);
+        console.log('');
+      }
+    } catch {
+      console.error('\n  Error: Cannot connect to worker. Start with: totalrecall worker:start\n');
+      process.exit(1);
+    }
+    return;
+  }
+
+  if (subCommand === 'revoke') {
+    const tokenId = subArgs[1];
+    if (!tokenId) {
+      console.error('\n  Error: Token ID is required.');
+      console.error('  Usage: totalrecall share revoke <id>\n');
+      process.exit(1);
+    }
+
+    try {
+      const result = await apiDelete(`/api/sharing/tokens/${encodeURIComponent(tokenId)}`);
+
+      if (result.status === 404) {
+        console.error(`\n  Error: Token not found or already revoked.\n`);
+        process.exit(1);
+      }
+      if (result.status !== 200) {
+        console.error(`\n  Error: ${result.data.error || 'Failed to revoke token'}\n`);
+        process.exit(1);
+      }
+
+      console.log(`\n  ✅ Token ${tokenId} revoked successfully.\n`);
+    } catch {
+      console.error('\n  Error: Cannot connect to worker. Start with: totalrecall worker:start\n');
+      process.exit(1);
+    }
+    return;
+  }
+
+  console.error(`\n  Unknown share subcommand: ${subCommand}`);
+  console.error('  Usage: totalrecall share create|list|revoke\n');
+  process.exit(1);
+}
+
 function showHelp() {
   console.log(`Usage: totalrecall <command> [options]
 
@@ -2896,6 +3424,9 @@ Commands:
   plugins list              Elenca tutti i plugin registrati con stato
   plugins enable <nome>     Abilita un plugin registrato
   plugins disable <nome>    Disabilita un plugin attivo
+  share create [options]    Create a read-only sharing token
+  share list                List all sharing tokens
+  share revoke <id>         Revoke a sharing token
   help                      Show this help message
 
 Examples:
@@ -2931,7 +3462,369 @@ Examples:
   totalrecall decay detect-stale
   totalrecall decay consolidate --dry-run
   totalrecall observations 20
+  totalrecall share create --project myapp --expires 7d
+  totalrecall share list
+  totalrecall share revoke <token-id>
 `);
+}
+
+// ─── Users Commands (Multi-user Management) ─────────────────────────────────────
+
+/**
+ * Handles `totalrecall users <subcommand>`.
+ *
+ * Subcommands:
+ *   create <email> --role admin|editor|viewer  — create user with generated password
+ *   list                                        — show all users
+ *   role <email> <role>                         — change user role
+ *   delete <email>                              — deactivate user
+ */
+async function handleUsers(subArgs: string[]): Promise<void> {
+  const subCommand = subArgs[0];
+  const port = process.env.TOTALRECALL_WORKER_PORT || process.env.CONTEXTKIT_WORKER_PORT || '3001';
+  const baseUrl = `http://127.0.0.1:${port}`;
+
+  // For users commands, we operate directly on the database (no auth needed for local CLI)
+  if (!subCommand || subCommand === 'help') {
+    console.log(`
+Usage: totalrecall users <subcommand>
+
+Subcommands:
+  create <email> [options]  Create a new user
+  list                      List all users
+  role <email> <role>       Change user role (admin|editor|viewer)
+  delete <email>            Deactivate a user
+
+Options for 'create':
+  --role <role>     Role: admin, editor, viewer (default: viewer)
+  --name <name>     Display name (default: derived from email)
+  --password <pwd>  Set password (default: auto-generated)
+
+Examples:
+  totalrecall users create admin@example.com --role admin
+  totalrecall users list
+  totalrecall users role user@example.com editor
+  totalrecall users delete old@example.com
+`);
+    return;
+  }
+
+  if (subCommand === 'create') {
+    const email = subArgs[1];
+    if (!email || !email.includes('@')) {
+      console.error('\n  Error: valid email is required.\n  Usage: totalrecall users create <email> --role <role>\n');
+      process.exit(1);
+    }
+
+    let role = 'viewer';
+    let displayName = '';
+    let password = '';
+
+    for (let i = 2; i < subArgs.length; i++) {
+      const arg = subArgs[i];
+      if (arg === '--role' && subArgs[i + 1]) {
+        role = subArgs[++i]!;
+      } else if (arg === '--name' && subArgs[i + 1]) {
+        displayName = subArgs[++i]!;
+      } else if (arg === '--password' && subArgs[i + 1]) {
+        password = subArgs[++i]!;
+      }
+    }
+
+    if (!['admin', 'editor', 'viewer'].includes(role)) {
+      console.error(`\n  Error: invalid role "${role}". Must be admin, editor, or viewer.\n`);
+      process.exit(1);
+    }
+
+    // Direct DB access for CLI user creation (no auth needed locally)
+    const db = new TotalRecallDatabase();
+    try {
+      const { getUserByEmail, createUser, countAdmins } = await import('../services/sqlite/Users.js');
+
+      const normalizedEmail = email.toLowerCase().trim();
+      const existing = getUserByEmail(db.db, normalizedEmail);
+      if (existing) {
+        console.error(`\n  Error: user "${normalizedEmail}" already exists.\n`);
+        process.exit(1);
+      }
+
+      // Hash password
+      const crypto = await import('crypto');
+      let plainPassword = password || crypto.randomBytes(16).toString('base64url');
+      let passwordHash: string;
+      try {
+        const bcrypt = await import('bcryptjs');
+        passwordHash = bcrypt.hashSync(plainPassword, 10);
+      } catch {
+        passwordHash = crypto.createHash('sha256').update(plainPassword).digest('hex');
+      }
+
+      const name = displayName || normalizedEmail.split('@')[0] || normalizedEmail;
+      const user = createUser(db.db, normalizedEmail, passwordHash, role as any, name);
+
+      console.log('\n=== User Created ===\n');
+      console.log(`  Email:     ${user.email}`);
+      console.log(`  Role:      ${user.role}`);
+      console.log(`  Name:      ${user.display_name}`);
+      if (!password) {
+        console.log(`  Password:  ${plainPassword}`);
+        console.log('');
+        console.log('  ⚠️  Save this password — it will not be shown again.');
+      }
+      console.log('');
+    } finally {
+      db.close();
+    }
+    return;
+  }
+
+  if (subCommand === 'list') {
+    const db = new TotalRecallDatabase();
+    try {
+      const { listUsers } = await import('../services/sqlite/Users.js');
+      const users = listUsers(db.db);
+
+      if (users.length === 0) {
+        console.log('\n  No users found. Create one with: totalrecall users create <email> --role admin\n');
+        return;
+      }
+
+      console.log('\n=== Total Recall — Users ===\n');
+      console.log('  ' + 'Email'.padEnd(30) + 'Role'.padEnd(10) + 'Name'.padEnd(20) + 'Active' + '  Last Login');
+      console.log('  ' + '-'.repeat(90));
+
+      for (const user of users) {
+        const active = user.is_active ? '✓' : '✗';
+        const lastLogin = user.last_login
+          ? new Date(user.last_login).toLocaleString()
+          : 'never';
+        console.log(
+          '  ' +
+          user.email.padEnd(30) +
+          user.role.padEnd(10) +
+          (user.display_name || '').padEnd(20) +
+          active.padEnd(8) +
+          lastLogin
+        );
+      }
+      console.log('');
+    } finally {
+      db.close();
+    }
+    return;
+  }
+
+  if (subCommand === 'role') {
+    const email = subArgs[1];
+    const newRole = subArgs[2];
+
+    if (!email || !newRole) {
+      console.error('\n  Usage: totalrecall users role <email> <admin|editor|viewer>\n');
+      process.exit(1);
+    }
+
+    if (!['admin', 'editor', 'viewer'].includes(newRole)) {
+      console.error(`\n  Error: invalid role "${newRole}". Must be admin, editor, or viewer.\n`);
+      process.exit(1);
+    }
+
+    const db = new TotalRecallDatabase();
+    try {
+      const { getUserByEmail, updateUserRole, countAdmins } = await import('../services/sqlite/Users.js');
+
+      const user = getUserByEmail(db.db, email.toLowerCase().trim());
+      if (!user) {
+        console.error(`\n  Error: user "${email}" not found.\n`);
+        process.exit(1);
+      }
+
+      // Prevent removing last admin
+      if (user.role === 'admin' && newRole !== 'admin') {
+        const adminCount = countAdmins(db.db);
+        if (adminCount <= 1) {
+          console.error('\n  Error: cannot remove the last admin.\n');
+          process.exit(1);
+        }
+      }
+
+      updateUserRole(db.db, user.id, newRole as any);
+      console.log(`\n  Updated: ${user.email} role changed from "${user.role}" to "${newRole}"\n`);
+    } finally {
+      db.close();
+    }
+    return;
+  }
+
+  if (subCommand === 'delete') {
+    const email = subArgs[1];
+    if (!email) {
+      console.error('\n  Usage: totalrecall users delete <email>\n');
+      process.exit(1);
+    }
+
+    const db = new TotalRecallDatabase();
+    try {
+      const { getUserByEmail, deactivateUser, countAdmins } = await import('../services/sqlite/Users.js');
+
+      const user = getUserByEmail(db.db, email.toLowerCase().trim());
+      if (!user) {
+        console.error(`\n  Error: user "${email}" not found.\n`);
+        process.exit(1);
+      }
+
+      if (user.role === 'admin') {
+        const adminCount = countAdmins(db.db);
+        if (adminCount <= 1) {
+          console.error('\n  Error: cannot deactivate the last admin.\n');
+          process.exit(1);
+        }
+      }
+
+      deactivateUser(db.db, user.id);
+      console.log(`\n  Deactivated: ${user.email}\n`);
+    } finally {
+      db.close();
+    }
+    return;
+  }
+
+  console.error(`\n  Unknown subcommand: ${subCommand}`);
+  console.error('  Use: totalrecall users help\n');
+  process.exit(1);
+}
+
+// ─── Team Sync Commands ─────────────────────────────────────────────────────────
+
+async function handleTeam(subArgs: string[]): Promise<void> {
+  const subCommand = subArgs[0];
+
+  if (!subCommand || subCommand === 'help') {
+    console.log(`
+  totalrecall team — Sync shared knowledge with your team via Git
+
+  Commands:
+    init <repo-url>    Initialize team sync (clone repo, save config)
+    push               Export knowledge → commit → push to remote
+    pull               Pull from remote → import new knowledge (local wins)
+    status             Show sync configuration and state
+
+  Options (init):
+    --interval <min>   Auto-sync interval in minutes (default: 60)
+
+  Examples:
+    totalrecall team init git@github.com:my-org/shared-knowledge.git
+    totalrecall team push
+    totalrecall team pull
+    totalrecall team status
+`);
+    return;
+  }
+
+  if (subCommand === 'init') {
+    const repoUrl = subArgs[1];
+    if (!repoUrl) {
+      console.error('  Error: Please provide a repository URL.\n  Example: totalrecall team init git@github.com:org/repo.git\n');
+      process.exit(1);
+    }
+
+    const intervalIdx = subArgs.indexOf('--interval');
+    const syncInterval = intervalIdx >= 0 ? parseInt(subArgs[intervalIdx + 1] ?? '60', 10) : 60;
+
+    try {
+      const config = initTeamConfig(repoUrl, { syncInterval });
+      console.log(`\n  ✅ Team sync initialized.`);
+      console.log(`     Repo: ${config.repoUrl}`);
+      console.log(`     Local: ${config.localPath}`);
+      console.log(`     Sync interval: ${config.syncInterval} min\n`);
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      console.error(`  ❌ Failed to initialize team sync: ${msg}\n`);
+      process.exit(1);
+    }
+    return;
+  }
+
+  if (subCommand === 'push') {
+    const config = loadTeamConfig();
+    if (!config) {
+      console.error('  ❌ Team sync not initialized. Run: totalrecall team init <repo-url>\n');
+      process.exit(1);
+    }
+
+    const db = new TotalRecallDatabase();
+    try {
+      console.log('  Exporting knowledge and pushing...');
+      const result = pushKnowledge(db.db, config);
+
+      console.log(`\n  ✅ Push complete.`);
+      console.log(`     Exported: ${result.exported} items`);
+      if (result.errors.length > 0) {
+        console.log(`     ⚠️  Errors:`);
+        for (const err of result.errors) {
+          console.log(`        - ${err}`);
+        }
+      }
+      console.log('');
+    } finally {
+      db.close();
+    }
+    return;
+  }
+
+  if (subCommand === 'pull') {
+    const config = loadTeamConfig();
+    if (!config) {
+      console.error('  ❌ Team sync not initialized. Run: totalrecall team init <repo-url>\n');
+      process.exit(1);
+    }
+
+    const db = new TotalRecallDatabase();
+    try {
+      console.log('  Pulling from remote and importing...');
+      const result = pullKnowledge(db.db, config);
+
+      console.log(`\n  ✅ Pull complete.`);
+      console.log(`     Imported: ${result.imported} items`);
+      if (result.conflicts.length > 0) {
+        console.log(`     ℹ️  Conflicts (local wins):`);
+        for (const conflict of result.conflicts) {
+          console.log(`        - ${conflict}`);
+        }
+      }
+      if (result.errors.length > 0) {
+        console.log(`     ⚠️  Errors:`);
+        for (const err of result.errors) {
+          console.log(`        - ${err}`);
+        }
+      }
+      console.log('');
+    } finally {
+      db.close();
+    }
+    return;
+  }
+
+  if (subCommand === 'status') {
+    const config = loadTeamConfig();
+    if (!config) {
+      console.log('\n  Team sync: not configured');
+      console.log('  Run: totalrecall team init <repo-url>\n');
+      return;
+    }
+
+    const status = getTeamStatus(config);
+    console.log(`\n  📡 Team Sync Status`);
+    console.log(`     Repo:       ${status.repoUrl}`);
+    console.log(`     Local path: ${status.localPath}`);
+    console.log(`     Last sync:  ${status.lastSync || 'never'}`);
+    console.log(`     Interval:   ${status.syncInterval} min`);
+    console.log(`     Shared items: ${status.localKnowledgeCount} files\n`);
+    return;
+  }
+
+  console.error(`  Unknown team subcommand: ${subCommand}`);
+  console.error('  Use: init | push | pull | status\n');
+  process.exit(1);
 }
 
 main().catch(console.error);

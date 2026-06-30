@@ -56,6 +56,11 @@ import { createDocsRouter } from './openapi/index.js';
 import { createBackupRouter } from './routes/backup.js';
 // Router plugin system
 import { createPluginsRouter } from './routes/plugins.js';
+// Router auth + users (multi-user)
+import { createAuthRouter } from './routes/auth.js';
+import { createUsersRouter } from './routes/users.js';
+// Router sharing (read-only JWT access)
+import { createSharingRouter } from './routes/sharing.js';
 
 // ── Configuration ──
 
@@ -158,6 +163,11 @@ app.use(createDocsRouter());
 app.use(createBackupRouter(ctx, WORKER_TOKEN));
 // Plugin system
 app.use(createPluginsRouter(ctx));
+// Auth + Users (multi-user)
+app.use(createAuthRouter(ctx));
+app.use(createUsersRouter(ctx));
+// Sharing (read-only JWT access)
+app.use(createSharingRouter(ctx, WORKER_TOKEN));
 
 // ── Static files and viewer ──
 
